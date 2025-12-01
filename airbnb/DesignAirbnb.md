@@ -4,44 +4,57 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
 
 ## Table of Contents
 
-### Part I: Core Architecture
-1. [Assumptions and Scope](#assumptions-and-scope)
-2. [High-Level Architecture](#high-level-architecture)
-3. [Core Domain Model](#core-domain-model-simplified)
-4. [Key Design Tenets](#key-design-tenets)
-
-### Part II: Core Systems
-5. [Search & Discovery](#search--discovery)
-6. [Availability and Calendar](#availability-and-calendar-the-safety-critical-part)
-7. [Booking Flow](#booking-flow-end-to-end)
-8. [Payments and Payouts](#payments-and-payouts)
-9. [Pricing & Rules](#pricing--rules)
-10. [Messaging and Notifications](#messaging-and-notifications)
-11. [Reviews and Reputation](#reviews-and-reputation)
-12. [Trust, Safety, and Risk](#trust-safety-and-risk)
-13. [Media and Content](#media-and-content)
-
-### Part III: Infrastructure & Operations
-14. [Multi-Region and Resilience](#multi-region-and-resilience)
-15. [Caching Strategy](#caching-strategy)
-16. [Data Platform and Analytics](#data-platform-and-analytics)
-17. [Security and Privacy](#security-and-privacy)
-18. [APIs](#apis-illustrative)
-19. [Indexing and Availability Acceleration](#indexing-and-availability-acceleration)
-20. [Cost and Performance Considerations](#cost-and-performance-considerations)
-21. [Operations and SRE](#operations-and-sre)
-22. [Content and Policy Edge Cases](#content-and-policy-edge-cases)
-
-### Part IV: Capacity Planning & Rollout
-23. [Minimal Back-of-the-Envelope](#minimal-back-of-the-envelope-order-of-magnitude)
-24. [Phased Rollout](#phased-rollout)
-25. [Trade-offs and Rationale](#trade-offs-and-rationale)
-
-### Part V: Architectural Diagrams
-26. [System Architecture Diagrams](#system-architecture-diagrams)
-
-### Part VI: Search & Discovery Deep-Dive
-27. [Search System: Detailed Design](#search-system-detailed-design)
+- [Part I: Core Architecture](#part-i-core-architecture)
+  - [Assumptions and Scope](#assumptions-and-scope)
+  - [High-Level Architecture](#high-level-architecture)
+  - [Core Domain Model](#core-domain-model-simplified)
+  - [Key Design Tenets](#key-design-tenets)
+- [Part II: Core Systems](#part-ii-core-systems)
+  - [Search & Discovery](#search--discovery)
+  - [Availability and Calendar](#availability-and-calendar-the-safety-critical-part)
+  - [Booking Flow](#booking-flow-end-to-end)
+  - [Payments and Payouts](#payments-and-payouts)
+  - [Pricing & Rules](#pricing--rules)
+  - [Messaging and Notifications](#messaging-and-notifications)
+  - [Reviews and Reputation](#reviews-and-reputation)
+  - [Trust, Safety, and Risk](#trust-safety-and-risk)
+  - [Media and Content](#media-and-content)
+- [Part III: Infrastructure & Operations](#part-iii-infrastructure--operations)
+  - [Multi-Region and Resilience](#multi-region-and-resilience)
+  - [Caching Strategy](#caching-strategy)
+  - [Data Platform and Analytics](#data-platform-and-analytics)
+  - [Security and Privacy](#security-and-privacy)
+  - [APIs](#apis-illustrative)
+  - [Indexing and Availability Acceleration](#indexing-and-availability-acceleration)
+  - [Cost and Performance Considerations](#cost-and-performance-considerations)
+  - [Operations and SRE](#operations-and-sre)
+  - [Content and Policy Edge Cases](#content-and-policy-edge-cases)
+- [Part IV: Capacity Planning & Rollout](#part-iv-capacity-planning--rollout)
+  - [Minimal Back-of-the-Envelope](#minimal-back-of-the-envelope-order-of-magnitude)
+  - [Phased Rollout](#phased-rollout)
+  - [Trade-offs and Rationale](#trade-offs-and-rationale)
+- [Part V: Architectural Diagrams](#part-v-architectural-diagrams)
+  - [High-Level Component Architecture](#high-level-component-architecture)
+  - [Core Booking Flow](#core-booking-flow)
+  - [Availability Hold Algorithm](#availability-hold-algorithm)
+  - [Search Query Path](#search-query-path)
+  - [Eventing, Outbox, and Indexing Pipeline](#eventing-outbox-and-indexing-pipeline-cqrs)
+  - [Multi-Region Topology (Option A)](#multi-region-topology-option-a-global-strongly-consistent-db)
+  - [Multi-Region Topology (Option B)](#multi-region-topology-option-b-cell-based-booking)
+  - [Core Data Model](#core-data-model-entity-relationship-diagram)
+  - [Cancellation and Refund Saga](#cancellation-and-refund-saga)
+- [Part VI: Search & Discovery Deep-Dive](#part-vi-search--discovery-deep-dive)
+  - [Search System: Detailed Design](#search-system-detailed-design)
+    - [Objectives and SLOs](#objectives-and-slos)
+    - [Indexing: Document Design, Pipeline, and Shards](#indexing-document-design-pipeline-and-shards)
+    - [Geolookup and Spatial Model](#geolookup-and-spatial-model)
+    - [Query Path](#query-path-end-to-end)
+    - [Availability Bitset Check Details](#availability-bitset-check-details)
+    - [Ranking and Personalization](#ranking-and-personalization)
+    - [Caching Strategy](#caching-strategy-1)
+    - [API Design](#api-design-key-endpoints)
+    - [Operational and Failure Modes](#operational-and-failure-modes)
+- [Appendix: Open Questions](#appendix-open-questions)
 
 ---
 
@@ -107,6 +120,8 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
 * Idempotency and outbox patterns everywhere that matters (payments, booking).
 * Graceful degradation for non-critical paths (e.g., fallback ranking, reduced images).
 
+[Back to Top](#table-of-contents)
+
 ---
 
 ## Part II: Core Systems
@@ -151,7 +166,7 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
 * Partitioning:
   + Partition (listing\_id mod N) keeps all dates of a listing co-located; supports atomic multi-row ops in a shard/transaction.
 * Instant Book vs Request-to-Book:
-  +   + Request-to-Book creates a host-review pending reservation with a soft hold (shorter TTL), auto-expire if host doesn't act; host acceptance confirms and charges.
+  + Request-to-Book creates a host-review pending reservation with a soft hold (shorter TTL), auto-expire if host doesn't act; host acceptance confirms and charges.
 
 ## Booking Flow (End-to-End)
 
@@ -183,7 +198,7 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
 * Rules engine enforces min/max nights, lead time, gaps, check-in days, prep time, and group size constraints.
 * Precompute per listing per month rule masks to accelerate “fast feasibility” checks.
 
-Messaging and notifications
+## Messaging and Notifications
 
 * Messaging: chat threads per reservation/listing inquiry; push + email fallbacks.
 * Moderation: PII redaction (before booking), unsafe content detection (NLP), link obfuscation.
@@ -208,6 +223,8 @@ Messaging and notifications
 * Photo upload to object storage; virus scan; EXIF scrub; deduplicate; on-demand resizing via CDN edge workers; WebP/AVIF optimization.
 * Video support via transcode pipeline.
 * SEO: static prerendered listing pages with edge caching; sitemap generation; hreflang; canonical URLs.
+
+[Back to Top](#table-of-contents)
 
 ---
 
@@ -308,6 +325,8 @@ Messaging and notifications
 * Partial approvals: allow “date shift” suggestions; handle extra guest fees, pet fees.
 * Accessibility filters validated with human review.
 
+[Back to Top](#table-of-contents)
+
 ---
 
 ## Part IV: Capacity Planning & Rollout
@@ -333,11 +352,11 @@ Messaging and notifications
 * Global DB vs cell-based: global DB simplifies correctness; cell-based reduces vendor lock-in and cost but increases failover complexity.
 * Microservices where domain boundaries are clear; otherwise favor well-modularized services to avoid accidental distributed monolith.
 
+[Back to Top](#table-of-contents)
+
 ---
 
 ## Part V: Architectural Diagrams
-
-## System Architecture Diagrams
 
 Here are concise, production-grade Mermaid diagrams covering components, request lifecycles, dataflow/eventing, multi-region topology, and the core schema.
 
@@ -701,19 +720,17 @@ B--)N: Notify guest & host
 N-->>U: Cancellation confirmed
 ```
 
+[Back to Top](#table-of-contents)
+
 ---
 
 ## Part VI: Search & Discovery Deep-Dive
 
 ## Search System: Detailed Design
 
-Here's a deep-dive into Airbnb's Search & Discovery system with concrete data models, geo lookup design, availability filtering, ranking/personalization, caching, and operational choices.
+Here's a deep-dive into Airbnb's Search & Discovery system with concrete data models, geo lookup design, availability filtering, ranking/personalization, caching, and operational choices. I’ve included Mermaid diagrams for dataflow and request lifecycles.
 
 ### Objectives and SLOs
-
-Here’s a deep-dive into Airbnb’s Search & Discovery system with concrete data models, geo lookup design, availability filtering, ranking/personalization, caching, and operational choices. I’ve included Mermaid diagrams for dataflow and request lifecycles.
-
-Objectives and SLOs
 
 * Relevance: High-precision recall of truly bookable listings for the user’s context.
 * Latency: p95 < 300 ms end-to-end for typical searches; sub-150 ms map-pan updates.
@@ -1049,6 +1066,8 @@ end
 * H3-based tiling yields stable, cacheable partitions and cheap aggregation, while still allowing precise geo\_shape when necessary.
 * Adaptive widening balances result quality with query latency.
 
+[Back to Top](#table-of-contents)
+
 ---
 
 ## Appendix: Open Questions
@@ -1060,3 +1079,5 @@ end
 * Target cloud(s) and existing PSP preferences?
 * Adapt for specially the booking/DB choices and sketch a reference deployment topology with concrete tech picks?
 * Elaborate more on concrete OpenSearch mappings, example H3 resolutions per zoom level, or the LTR feature dictionary and training cadence for your markets?
+
+[Back to Top](#table-of-contents)
