@@ -1,6 +1,53 @@
-An end-to-end, production-grade design for Airbnb-style “Stays” (homes/rooms). It emphasizes scalability, resilience, correctness (no double-bookings), global reach, and cost control. I’ll outline scope, architecture, critical pathways (search, availability, booking, payments), data models, reliability patterns, and ops.
+# Airbnb System Design
 
-Assumptions and scope
+An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). It emphasizes scalability, resilience, correctness (no double-bookings), global reach, and cost control.
+
+## Table of Contents
+
+### Part I: Core Architecture
+1. [Assumptions and Scope](#assumptions-and-scope)
+2. [High-Level Architecture](#high-level-architecture)
+3. [Core Domain Model](#core-domain-model-simplified)
+4. [Key Design Tenets](#key-design-tenets)
+
+### Part II: Core Systems
+5. [Search & Discovery](#search--discovery)
+6. [Availability and Calendar](#availability-and-calendar-the-safety-critical-part)
+7. [Booking Flow](#booking-flow-end-to-end)
+8. [Payments and Payouts](#payments-and-payouts)
+9. [Pricing & Rules](#pricing--rules)
+10. [Messaging and Notifications](#messaging-and-notifications)
+11. [Reviews and Reputation](#reviews-and-reputation)
+12. [Trust, Safety, and Risk](#trust-safety-and-risk)
+13. [Media and Content](#media-and-content)
+
+### Part III: Infrastructure & Operations
+14. [Multi-Region and Resilience](#multi-region-and-resilience)
+15. [Caching Strategy](#caching-strategy)
+16. [Data Platform and Analytics](#data-platform-and-analytics)
+17. [Security and Privacy](#security-and-privacy)
+18. [APIs](#apis-illustrative)
+19. [Indexing and Availability Acceleration](#indexing-and-availability-acceleration)
+20. [Cost and Performance Considerations](#cost-and-performance-considerations)
+21. [Operations and SRE](#operations-and-sre)
+22. [Content and Policy Edge Cases](#content-and-policy-edge-cases)
+
+### Part IV: Capacity Planning & Rollout
+23. [Minimal Back-of-the-Envelope](#minimal-back-of-the-envelope-order-of-magnitude)
+24. [Phased Rollout](#phased-rollout)
+25. [Trade-offs and Rationale](#trade-offs-and-rationale)
+
+### Part V: Architectural Diagrams
+26. [System Architecture Diagrams](#system-architecture-diagrams)
+
+### Part VI: Search & Discovery Deep-Dive
+27. [Search System: Detailed Design](#search-system-detailed-design)
+
+---
+
+## Part I: Core Architecture
+
+## Assumptions and Scope
 
 * Scope: Stays marketplace (guests, hosts, listings, search, booking, reviews, messaging, payments/payouts, trust & safety, support). Experiences can be added later with similar primitives.
 * Scale (design targets):
@@ -11,7 +58,7 @@ Assumptions and scope
   + Search p95 < 300ms; Listing page p95 < 250ms; Booking hold p95 < 250ms; Payment confirmation < 5s (async-friendly)
 * Availability SLOs: 99.95% (user-facing); Booking availability 99.99% to minimize lost revenue
 
-High-level architecture
+## High-Level Architecture
 
 * Clients: Web, iOS, Android
 * Edge/CDN: Static assets, images, map tiles, API edge termination; WAF, bot protection
@@ -41,7 +88,7 @@ High-level architecture
   + Kafka (multi-region), schema registry, outbox pattern for reliable change capture
   + CQRS where read models diverge (e.g., search index, availability bitmaps)
 
-Core domain model (simplified)
+## Core Domain Model (Simplified)
 
 * User(user\_id, type: guest|host, KYC\_state, risk\_score)
 * Listing(listing\_id, host\_id, location(H3/S2 index), attributes, photos, policies, min/max stays, check-in/out times)
@@ -52,7 +99,7 @@ Core domain model (simplified)
 * Review(review\_id, listing\_id, guest\_id, host\_id, rating, text, blind\_until)
 * Message(thread\_id, message\_id, sender\_id, text, attachments, redaction\_flags)
 
-Key design tenets
+## Key Design Tenets
 
 * Separate read-optimized discovery (eventually consistent) from write-critical booking (strongly consistent).
 * Partition by listing\_id (or geo cell) everywhere possible to localize contention and scale horizontally.
@@ -60,7 +107,11 @@ Key design tenets
 * Idempotency and outbox patterns everywhere that matters (payments, booking).
 * Graceful degradation for non-critical paths (e.g., fallback ranking, reduced images).
 
-Search & discovery
+---
+
+## Part II: Core Systems
+
+## Search & Discovery
 
 * Indexing:
   + Write path: Listing updates -> outbox -> Kafka -> Search Indexer (enriches from Pricing/Availability snapshot) -> OpenSearch/Vespa
@@ -76,7 +127,7 @@ Search & discovery
 * Caching:
   + Popular tiles cached at edge; similar-listings and embeddings cached in Redis; result page caching per query signature with short TTLs
 
-Availability and calendar (the safety-critical part)
+## Availability and Calendar (The Safety-Critical Part)
 
 * Data model:
   + One row per listing\_id + date (granularity: night). Fields: state, hold\_token, hold\_expiry, version.
@@ -100,9 +151,9 @@ Availability and calendar (the safety-critical part)
 * Partitioning:
   + Partition (listing\_id mod N) keeps all dates of a listing co-located; supports atomic multi-row ops in a shard/transaction.
 * Instant Book vs Request-to-Book:
-  + Request-to-Book creates a host-review pending reservation with a soft hold (shorter TTL), auto-expire if host doesn’t act; host acceptance confirms and charges.
+  +   + Request-to-Book creates a host-review pending reservation with a soft hold (shorter TTL), auto-expire if host doesn't act; host acceptance confirms and charges.
 
-Booking flow (end-to-end)
+## Booking Flow (End-to-End)
 
 1. Client fetches Listing details (price, rules) + Availability bitset.
 2. Client requests “CreateHold(listing\_id, start, end, guests, payment\_method\_hint, idempotency\_key)”.
@@ -112,7 +163,7 @@ Booking flow (end-to-end)
 6. Payments capture; Payout scheduled; Notifications dispatched; Search index updated via Kafka.
 7. If any failure after hold: release calendar; if payment capture fails post-confirmation, follow compensating logic (rare; risk-managed).
 
-Payments and payouts
+## Payments and Payouts
 
 * Integrations: PSPs (Adyen/Stripe/Braintree), optional local methods; vault sensitive data with PCI-DSS compliance.
 * Flows:
@@ -125,7 +176,7 @@ Payments and payouts
 * Tax:
   + VAT/GST, occupancy taxes; marketplace facilitator rules; per-jurisdiction engines; invoice generation; W-9/W-8BEN/1099/EC Sales lists for hosts.
 
-Pricing & rules
+## Pricing & Rules
 
 * Inputs: base price, seasonal/holiday adjustments, demand signals, competitor sets, host preferences.
 * Dynamic pricing service provides suggestions and real-time quotes; never blocks booking if service is down—fallback to cache or last known.
@@ -139,26 +190,30 @@ Messaging and notifications
 * Real-time infra: WebSockets/HTTP2 SSE via edge; store messages in durable store with read replicas.
 * Notifications: template service + locale; rate limits; user preferences; retries with exponential backoff; multi-channel.
 
-Reviews and reputation
+## Reviews and Reputation
 
 * Double-blind reviews: each side has X days to submit; publish only after both or deadline.
 * Fraud/spam detection; ML for review helpfulness.
 * Seller quality: cancellation rate, response time, acceptance rate feed into ranking and trust surfaces.
 
-Trust, safety, and risk
+## Trust, Safety, and Risk
 
 * Identity: KYC for hosts; optional guest verification; document + selfie liveness; device fingerprinting; IP/fraud signals.
 * Risk scoring: real-time features (velocity, card risk, mismatch, graph connections), offline models; high-risk bookings require additional verification or manual review.
 * Content moderation: images and text scanning; adult/illegal content detection; auto takedown workflows.
 * Property damage protection: deposits or waiver products; claims flow integrated with payouts.
 
-Media and content
+## Media and Content
 
 * Photo upload to object storage; virus scan; EXIF scrub; deduplicate; on-demand resizing via CDN edge workers; WebP/AVIF optimization.
 * Video support via transcode pipeline.
 * SEO: static prerendered listing pages with edge caching; sitemap generation; hreflang; canonical URLs.
 
-Multi-region and resilience
+---
+
+## Part III: Infrastructure & Operations
+
+## Multi-Region and Resilience
 
 * Global topology:
   + Active-active for read services (search, listings, profiles) with regional data stores.
@@ -175,7 +230,7 @@ Multi-region and resilience
 * Disaster recovery:
   + RPO ~ 0 for booking (sync replication), RTO < 30 min; regular game days/chaos tests.
 
-Caching strategy
+## Caching Strategy
 
 * CDN: images, CSS/JS, SSR HTML for landing pages, map tiles.
 * API response caches at edge for anonymous search (short TTL).
@@ -185,7 +240,7 @@ Caching strategy
 * Local in-process caches with TTL for ultra-hot config (feature flags)
 * Cache invalidation via pub/sub on entity change events.
 
-Data platform and analytics
+## Data Platform and Analytics
 
 * Event collection: clickstream (web/mobile SDKs), business events (bookings, cancellations, payments), operational metrics.
 * Stream processing: Kafka + Flink/Spark for near-real-time aggregates (conversion, supply-demand heatmaps).
@@ -194,7 +249,7 @@ Data platform and analytics
 * Feature store: real-time + offline features for ranking, pricing, risk; online store in Redis/KeyDB; offline in lake/warehouse.
 * Privacy: differential privacy for product analytics when needed.
 
-Security and privacy
+## Security and Privacy
 
 * Auth: OAuth/OIDC for clients; JWT access tokens; mTLS service-to-service; short-lived creds via SPIRE or IAM roles.
 * Secrets: HSM/KMS; envelope encryption; rotated on schedule.
@@ -202,7 +257,7 @@ Security and privacy
 * Compliance: GDPR/CCPA (consent, DSR tooling), PCI-DSS SAQ A-EP, ISO27001/SOC2.
 * Audit logging, tamper-evident logs for financial flows.
 
-APIs (illustrative)
+## APIs (Illustrative)
 
 * GET /search?bbox=...&dates=...&guests=...&filters=...
 * GET /listings/{id}
@@ -219,7 +274,7 @@ APIs (illustrative)
 * POST /reviews
 * Webhooks: payments.status\_changed, reservation.created, reservation.cancelled, payout.paid
 
-Indexing and availability acceleration
+## Indexing and Availability Acceleration
 
 * Availability bitsets:
   + For each listing, store a 400-bit year horizon per day (Roaring bitmap). Compose with rule masks (min stay, prep time) using bitwise ops.
@@ -229,14 +284,14 @@ Indexing and availability acceleration
 * Precomputed facets:
   + Popular filters (entire place, free cancellation) aggregated per geo cell to speed count queries.
 
-Cost and performance considerations
+## Cost and Performance Considerations
 
 * Object storage and CDN dominate costs; use aggressive image compression and responsive images.
 * Search cluster rightsized with autoscaling; reserve capacity for peak seasons.
 * Redis sized for bitsets and hot keys; eviction policies carefully tuned; multi-AZ replication with disk-backed snapshots.
 * Use spot/preemptible instances for stateless workers; bin pack with K8s.
 
-Operations and SRE
+## Operations and SRE
 
 * Observability: tracing (OpenTelemetry), metrics (RED/USE), structured logs with PII scrubbing.
 * SLOs and error budgets per service; automated rollback on SLO burn.
@@ -245,7 +300,7 @@ Operations and SRE
 * Backfills/reindex: dual-write + backfill with verification; shadow traffic for migrations.
 * Schema evolution: forward/backward compatible protobuf/Avro; contract testing.
 
-Content and policy edge cases
+## Content and Policy Edge Cases
 
 * Time zones: store in UTC; compute nights with listing’s local time; display in user’s locale.
 * Daylight savings transitions handled via local calendar service.
@@ -253,30 +308,40 @@ Content and policy edge cases
 * Partial approvals: allow “date shift” suggestions; handle extra guest fees, pet fees.
 * Accessibility filters validated with human review.
 
-Minimal back-of-the-envelope (order-of-magnitude)
+---
+
+## Part IV: Capacity Planning & Rollout
+
+## Minimal Back-of-the-Envelope (Order-of-Magnitude)
 
 * Listings: 10M; availability rows: ~10M \* 365 ≈ 3.65B (partitioned, compressed)
 * Bitmap memory: 10M listings \* 400 bits ≈ 500 MB raw; with metadata/overhead, ~3–5 GB in Redis across shards
 * Search QPS 100k: requires ~100–200 search nodes depending on doc size and query complexity; add 2–3x for headroom
 * Booking QPS 2k: with partitions, each shard handles ~50–100 RPS; comfortably managed with a few dozen shards and replicas
 
-Phased rollout
+## Phased Rollout
 
 * Phase 1 (MVP): Single region; strong DB (Postgres) with row locks for calendar; monolith + a few critical services (Payments, Search).
 * Phase 2: Kafka eventing, search indexer, Redis availability bitsets, image service/CDN; introduce Booking service with outbox.
 * Phase 3: Multi-region reads, cell-based booking or global DB; ML ranking and risk; advanced pricing; experimentation platform.
 * Phase 4: Full trust & safety stack, global payouts optimization, disaster recovery automation, continuous chaos.
 
-Trade-offs and rationale
+## Trade-offs and Rationale
 
 * Strong consistency for booking prevents double-bookings; read path tolerates eventual consistency.
 * Bitset availability gives fast search filters without hitting the transactional calendar.
 * Global DB vs cell-based: global DB simplifies correctness; cell-based reduces vendor lock-in and cost but increases failover complexity.
 * Microservices where domain boundaries are clear; otherwise favor well-modularized services to avoid accidental distributed monolith.
 
-Here are concise, production-grade Mermaid diagrams covering components, request lifecycles, dataflow/eventing, multi-region topology, and the core schema. They complement the design you already have.
+---
 
-High-level component architecture (domain-aligned services and data stores)
+## Part V: Architectural Diagrams
+
+## System Architecture Diagrams
+
+Here are concise, production-grade Mermaid diagrams covering components, request lifecycles, dataflow/eventing, multi-region topology, and the core schema.
+
+### High-Level Component Architecture
 
 ```mermaid
 graph TB
@@ -360,7 +425,7 @@ ETL --> Warehouse
 Edge -. Media fetch .-> ObjectStore
 ```
 
-Core booking flow (no double-bookings: hold -> pay -> confirm)
+### Core Booking Flow
 
 ```mermaid
 sequenceDiagram
@@ -408,7 +473,7 @@ B->>C: Release hold (HELD->FREE)
 end
 ```
 
-Availability hold algorithm (atomic, rollback on contention)
+### Availability Hold Algorithm
 
 ```mermaid
 flowchart TD
@@ -422,7 +487,7 @@ F -- Yes --> I[Rollback: release prior HELD by token]
 I --> J[Return NOT\_AVAILABLE]
 ```
 
-Search query path (bitset prefilter + index + ranking/personalization)
+### Search Query Path
 
 ```mermaid
 sequenceDiagram
@@ -452,7 +517,7 @@ S-->>G: Results page (list + map + counts)
 G-->>U: Render
 ```
 
-Eventing, outbox, and indexing pipeline (CQRS)
+### Eventing, Outbox, and Indexing Pipeline (CQRS)
 
 ```mermaid
 graph LR
@@ -480,7 +545,7 @@ K --> BS --> RC
 K --> W
 ```
 
-Multi-region topology (Option A: global strongly-consistent DB)
+### Multi-Region Topology (Option A: Global Strongly-Consistent DB)
 
 ```mermaid
 graph TB
@@ -515,7 +580,7 @@ Edge1 -. media .-> Obj
 Edge2 -. media .-> Obj
 ```
 
-Multi-region topology (Option B: cell-based booking with regional shards)
+### Multi-Region Topology (Option B: Cell-Based Booking)
 
 ```mermaid
 graph TB
@@ -550,7 +615,7 @@ API2 --> SIdx
 API3 --> SIdx
 ```
 
-Core data model (ER)
+### Core Data Model (Entity-Relationship Diagram)
 
 ```mermaid
 erDiagram
@@ -614,7 +679,7 @@ erDiagram
     }
 ```
 
-Cancellation and refund saga (policy-aware, compensating actions)
+### Cancellation and Refund Saga
 
 ```mermaid
 sequenceDiagram
@@ -636,6 +701,16 @@ B--)N: Notify guest & host
 N-->>U: Cancellation confirmed
 ```
 
+---
+
+## Part VI: Search & Discovery Deep-Dive
+
+## Search System: Detailed Design
+
+Here's a deep-dive into Airbnb's Search & Discovery system with concrete data models, geo lookup design, availability filtering, ranking/personalization, caching, and operational choices.
+
+### Objectives and SLOs
+
 Here’s a deep-dive into Airbnb’s Search & Discovery system with concrete data models, geo lookup design, availability filtering, ranking/personalization, caching, and operational choices. I’ve included Mermaid diagrams for dataflow and request lifecycles.
 
 Objectives and SLOs
@@ -645,8 +720,9 @@ Objectives and SLOs
 * Freshness: Availability and price updates reflected in minutes (index) and seconds (bitsets).
 * Scale: 100k RPS read path with burst tolerance; geo coverage global.
 
-1. Indexing: document design, pipeline, and shards
-   Search document (index mapping essentials)
+### Indexing: Document Design, Pipeline, and Shards
+
+#### Search Document (Index Mapping Essentials)
 
 * Keys
   + listing\_id (keyword), host\_id (keyword)
@@ -666,7 +742,7 @@ Objectives and SLOs
   + click\_ctr, save\_rate, cancellation\_rate, host\_response\_time, newness\_score, distance\_to\_center, price\_zscore\_in\_cell
 * Denormalized city/region/place\_ids for filters and SEO
 
-Indexing pipeline
+#### Indexing Pipeline
 
 * Write path
   + Listing/price/calendar updates -> Outbox -> Kafka (topics: listing\_updated, price\_updated, calendar\_delta)
@@ -679,7 +755,7 @@ Indexing pipeline
   + Routing preference for geo: optionally co-route listings by H3 super-cell for locality, but ensure even shard sizes.
   + Replication: 2–3 replicas; cross-AZ. For multi-region, regional clusters fed from Kafka.
 
-Availability side-channel (fast, exact date checks)
+#### Availability Side-Channel (Fast, Exact Date Checks)
 
 * For each listing: a 400-bit rolling window (next ~13 months), Roaring bitmap or bitset; 1=available night.
 * Key: avail:{listing\_id} => bitmap + version + updated\_at
@@ -691,7 +767,7 @@ Availability side-channel (fast, exact date checks)
 * Why this split
   + Index availability gives coarse pruning; Redis bitsets enforce correctness without hammering OLTP.
 
-Indexing and availability side-channel
+#### Indexing and Availability Side-Channel Diagram
 ```mermaid
 graph LR
 L[Listing Service] -->|outbox| K1[(Kafka listing\_updated)]
@@ -704,8 +780,9 @@ AV --> R[(Redis Bitsets)]
 C --> OLTP[(Booking/Calendar DB)]
 ```
 
-2. Geolookup and spatial model
-   Place resolution (text to place)
+### Geolookup and Spatial Model
+
+#### Place Resolution (Text to Place)
 
 * Place DB: curated from OSM/Who’s On First/Geonames + provider (Mapbox/Google), with:
   + place\_id, type (country/region/city/neighborhood/POI), polygon (GeoJSON), bbox, centroid, aliases/transliterations, popularity.
@@ -714,7 +791,7 @@ C --> OLTP[(Booking/Calendar DB)]
   + Fuzzy matching, typo tolerance, multi-lingual analyzers, popularity boosting.
 * Reverse geocoding: map coordinate to enclosing places via polygon index.
 
-Viewport and tiling
+#### Viewport and Tiling
 
 * Use H3 grid for server-side tiling, typically res 7–9 depending on zoom.
 * Map search
@@ -725,7 +802,7 @@ Viewport and tiling
     - server-side clustering and heatmaps
     - facet pre-aggregation caches keyed by cell
 
-Mermaid: Geolookup and viewport to cells
+#### Geolookup and Viewport to Cells Diagram
 
 ```mermaid
 sequenceDiagram
@@ -736,19 +813,21 @@ participant GEO as Geocoder/Places
 participant S as Search API
 U->>G: GET /search?q=barcelona&zoom=10
 G->>GEO: resolve(q=barcelona)
-GEO-->>G: {place\_id, polygon, bbox, centroid}
-G->>S: search(place\_id, polygon, zoom, filters)
+GEO-->>G: {place_id, polygon, bbox, centroid}
+G->>S: search(place_id, polygon, zoom, filters)
 S-->>S: polyfill polygon -> H3 cells (res by zoom)
 S-->>G: proceed with index query using cell tokens
 ```
 
-3. Query path (end-to-end)
-   Step-by-step (map or place search)
-4. Normalize request
+### Query Path (End-to-End)
+
+#### Step-by-Step (Map or Place Search)
+
+1. **Normalize request**
    * Resolve q to polygon (optional).
    * Compute H3 cells; clamp requested area to max cells; degrade resolution if necessary.
    * Normalize price filter to base or user currency; handle taxes display policy.
-5. Candidate retrieval (index)
+2. **Candidate retrieval (index)**
    * Query OpenSearch/Vespa with filters:
      + geo filter: h3\_cells\_rX terms or geo\_shape within polygon for precise boundary.
      + structural filters: capacity >= guests, amenities subset, property\_type, instant\_book, policies, rating >= X.
@@ -764,13 +843,13 @@ S-->>G: proceed with index query using cell tokens
    * Fetch personalization features (Feature Store).
    * Compute score = p(book|user, listing, context) via LTR model; calibrate per geo and device.
    * Apply diversity constraints (price bands, neighborhoods, property types) via greedy MMR/submodular optimization.
-8. Pagination and caching
+5. **Pagination and caching**
    * Build stable cursor using top-N candidate IDs + index sort key; store in short-lived cache to ensure consistent paging.
    * Cache result for anonymous queries by (cells, dates, guests, filters, sort) with 10–30s TTL; signed-in queries are partially cacheable (strip personalized effects for shared cache).
-9. Response
+6. **Response**
    * Return list results + map clusters + facet counts + price histogram.
 
-Mermaid: Query pipeline
+#### Query Pipeline Diagram
 
 ```mermaid
 flowchart LR
@@ -786,7 +865,7 @@ H --> I[Build page + clusters + histograms]
 I --> J[Cache & return]
 ```
 
-4. Availability bitset check details
+### Availability Bitset Check Details
 
 * Mask building
   + Nights = days between checkin and checkout in listing’s local timezone.
@@ -801,8 +880,9 @@ I --> J[Cache & return]
 * Consistency vs holds
   + Bitsets updated on hold/confirm/release; TTL sweeper ensures expired holds clear. Index might lag but Redis is source of truth for availability at search time.
 
-5. Ranking and personalization
-   Recall vs rank
+### Ranking and Personalization
+
+#### Recall vs Rank
 
 * Recall model (in index): inexpensive combination of BM25/ANN + static priors (quality\_score, proximity, price\_zscore).
 * LTR ranker: GBDT or DNN
@@ -815,7 +895,8 @@ I --> J[Cache & return]
     - Labels from bookings (primary), add clicks/saves as weak labels; counterfactual corrections and propensity scoring; time decay.
   + Objectives
     - Maximize calibrated p(book) while honoring constraints (fairness/exploration).
-      Diversification and fairness
+
+#### Diversification and Fairness
 * MMR/submodular: maximize score + lambda \* diversity distance with constraints:
   + avoid near-duplicate homes
   + ensure price spread, neighborhood spread
@@ -825,7 +906,7 @@ I --> J[Cache & return]
 * Guardrails
   + Risk/quality constraints: penalize high cancellation\_rate, low response, policy violations.
 
-6. Caching strategy
+### Caching Strategy
 
 * Edge caching
   + Anonymous browse pages and map tiles with short TTL (10–30s) keyed by tile+filters (excluding dates for extreme variability unless very common ranges, e.g., next weekend).
@@ -837,7 +918,7 @@ I --> J[Cache & return]
   + Debounce map move; send requests at most every 150–250 ms when dragging.
   + Reuse last candidate set for small viewport changes.
 
-7. API design (key endpoints)
+### API Design (Key Endpoints)
 
 * GET /search
   + Params: q, place\_id, bbox, zoom, start\_date, end\_date, guests, infants, pets, filters (amenities[], room\_type, property\_type, instant\_book, cancellation), price\_min/max (user currency), sort, page\_cursor, page\_size
@@ -850,14 +931,14 @@ I --> J[Cache & return]
 * GET /similar/{listing\_id}
   + Uses embedding KNN and market constraints
 
-8. Pricing and currency handling
+### Pricing and Currency Handling
 
 * Normalize price filters into user currency:
   + price\_normalized = price\_host\_currency \* fx\_rate[host->user]
   + fx\_rate updated multiple times per day; index stores price\_normalized for top 20 currencies; fallback convert at query-time for rare currencies.
 * Ranking uses price\_zscore within cell to avoid absolute price bias.
 
-9. Facets and aggregations at scale
+### Facets and Aggregations at Scale
 
 * Index aggregations:
   + amenity counts, property\_type counts, instant\_book counts
@@ -866,7 +947,7 @@ I --> J[Cache & return]
   + For hot markets, maintain Redis entries: cell:{res}:{cell\_id}:{filter\_signature} -> {counts, price\_hist} with 30–120s TTL.
   + Update via change events (listing on/offline) and periodic refresh.
 
-10. Multi-region and freshness
+### Multi-Region and Freshness
 
 * Each region runs a search cluster with local replicas; Kafka topics are mirrored.
 * Availability Redis is regional; cross-region replication optional since search is routed to nearest region; booking correctness relies on calendar DB not search.
@@ -874,13 +955,13 @@ I --> J[Cache & return]
   + Calendar delta -> Redis: p95 < 2s.
   + Listing change -> Index: p95 < 5m; urgent flags (suspend listing) trigger fast-lane reindex (< 30s).
 
-11. Observability and quality
+### Observability and Quality
 
 * Per-query diagnostics: timings for resolve, index, bitsets, rank, cache status
 * Quality dashboards: nDCG@k, book-through-rate, coverage, diversity metrics, bad-click rate
 * Online experiments: assignment service; guardrails for conversion, cancellations, CS contacts
 
-Pseudocode: server-side search
+### Pseudocode: Server-Side Search
 
 ```
 function search(req):
@@ -913,10 +994,9 @@ function search(req):
   result = buildResponse(page, aggs, clusters(ctx.cells, ranked), diagnostics)
   cache.set(sig, result, ttl=20s)  // anonymous-safe
   return result
-
 ```
 
-Mermaid: End-to-end search with caching and adaptive widening
+### End-to-End Search Flow with Caching and Adaptive Widening
 
 ```mermaid
 sequenceDiagram
@@ -957,23 +1037,26 @@ G-->>U: render
 end
 ```
 
-Operational and failure modes
+### Operational and Failure Modes
 
 * Degraded mode: If Redis bitset service is impaired, fallback to index-only availability\_ranges\_compact with a small false-positive rate; label results with “availability may have changed”.
 * Backpressure: If index latency > SLO, reduce K’ and prefer cached cell results; increase result TTLs temporarily.
 * Hotspots: Popular markets → pre-warm caches, shard pinning for high-density cells, autoscale search nodes with headroom.
 
-Key trade-offs
+### Key Trade-offs
 
 * Doing precise date validation in Redis keeps index lean and avoids heavy nested ranges, while index still carries coarse range summaries for degraded mode and early pruning.
 * H3-based tiling yields stable, cacheable partitions and cheap aggregation, while still allowing precise geo\_shape when necessary.
 * Adaptive widening balances result quality with query latency.
 
-If you want, I can tailor concrete OpenSearch mappings, example H3 resolutions per zoom level, or the LTR feature dictionary and training cadence for your markets.
+---
 
-Open questions to tailor further
+## Appendix: Open Questions
+
+### Open Questions to Tailor Further
 
 * Do you want Experiences integrated in v1 or later?
 * Preference for a global strongly-consistent DB vs cell-based regional booking?
 * Target cloud(s) and existing PSP preferences?
 * Adapt for specially the booking/DB choices and sketch a reference deployment topology with concrete tech picks?
+* Elaborate more on concrete OpenSearch mappings, example H3 resolutions per zoom level, or the LTR feature dictionary and training cadence for your markets?
