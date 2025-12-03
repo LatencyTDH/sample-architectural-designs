@@ -380,9 +380,6 @@ Silent memory corruption (bit flips) in KV cache leads to garbage output with no
         end
         
         Data --> CRC
-        
-        style Data fill:#e1f5fe
-        style CRC fill:#fff9c4
     ```
 
 *   **Validation Points:**
@@ -1453,10 +1450,6 @@ Detailed configuration and optimization for production deployment.
         
         Decision -->|accepted| Output[Response Stream]
         Decision -->|rejected| Draft
-        
-        style Draft fill:#c8e6c9
-        style Oracle fill:#ffcdd2
-        style Buffer fill:#fff9c4
     ```
 
 *   **Metrics & Monitoring:**
@@ -1633,10 +1626,6 @@ Pure latency-based routing is insufficient; we need capacity-aware global routin
         CB -->|health| RB
         RA -->|report| GCS
         RB -->|report| GCS
-        
-        style Global fill:#e3f2fd
-        style R53 fill:#bbdefb
-        style GCS fill:#c5cae9
     ```
 
 *   **Capacity Service Responsibilities:**
