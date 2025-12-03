@@ -2,19 +2,19 @@
 
 A quick reference for system design interviews and back-of-the-envelope calculations.
 
-> **Note**: These numbers are approximations for mental math. Real performance varies by hardware, workload, and conditions. Primary source: [sirupsen/napkin-math](https://github.com/sirupsen/napkin-math) benchmarks on Intel Xeon E-2236 (2024).
+> **Note**: These numbers are approximations for mental math. Real performance varies by hardware, workload, and conditions. I/O and network numbers are from [sirupsen/napkin-math](https://github.com/sirupsen/napkin-math) benchmarks (Intel Xeon E-2236). CPU/cache latencies are well-established values that haven't changed significantly in modern processors.
 
 ## CPU & Memory
 
 | Operation | Latency |
 |-----------|---------|
-| L1 cache reference | 0.5 ns |
-| Branch mispredict | 5 ns |
-| L2 cache reference | 7 ns |
-| Mutex lock/unlock | 25 ns |
-| Main memory reference | 100 ns |
-| Sequential memory read (64 bytes) | 0.5 ns |
-| Random memory read (64 bytes) | 50 ns |
+| L1 cache reference | ~1 ns |
+| Branch mispredict | ~3 ns |
+| L2 cache reference | ~4 ns |
+| Mutex lock/unlock | ~17 ns |
+| Main memory reference | ~100 ns |
+| Sequential memory R/W (64 bytes) | 0.5 ns |
+| Random memory R/W (64 bytes) | 50 ns |
 
 ## Hashing & Crypto
 
@@ -33,11 +33,10 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 
 ## Compression
 
-| Operation | Latency |
+| Operation | Latency/Throughput |
 |-----------|---------|
-| Compress 1KB with Snappy/Zippy | 3 µs |
-| Compression throughput (general) | ~500 MiB/s |
-| Decompression throughput | ~1 GiB/s |
+| Compression | ~500 MiB/s |
+| Decompression | ~1 GiB/s |
 
 ## Storage I/O
 
@@ -47,11 +46,12 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 | Random SSD read (8KB) | 100 µs |
 | Sequential SSD write (8KB, no fsync) | 10 µs |
 | Sequential SSD write (8KB, +fsync) | 1 ms |
-| Read 1MB sequentially from memory | 100-250 µs |
+| Read 1MB sequentially from memory | ~100 µs |
 | Read 1MB sequentially from SSD | 1 ms |
-| Read 1MB sequentially from HDD | 20 ms |
-| HDD disk seek | 10 ms |
-| Random HDD read (8KB) | 10 ms |
+| Read 1MB sequentially from HDD | 5 ms |
+| HDD seek time (7200 RPM) | 8-9 ms |
+| HDD rotational latency (7200 RPM) | 4 ms avg |
+| Random HDD read (8KB) | 12-13 ms |
 
 ## Network
 
@@ -98,12 +98,13 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 
 ## Key Takeaways
 
-1. **Memory is fast** — L1 cache is ~200x faster than main memory
-2. **SSDs changed everything** — Random reads went from 10ms (HDD) to 100µs (SSD)
+1. **Memory is fast** — L1 cache is ~100x faster than main memory
+2. **SSDs changed everything** — Random reads went from ~13ms (HDD) to 100µs (SSD)
 3. **Network is the bottleneck** — Even same-datacenter RTT is ~500µs
 4. **Crypto is expensive** — Bcrypt is intentionally slow (~300ms) for security
 5. **Context switches add up** — At ~10µs each, they matter at high throughput
 6. **fsync is costly** — SSD writes jump from 10µs to 1ms with durability guarantees
+7. **HDD = seek + rotation** — 8-9ms seek + 4ms rotation = ~12-13ms random access
 
 ## References
 
