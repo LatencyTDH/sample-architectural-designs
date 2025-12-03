@@ -1358,8 +1358,8 @@ Real deployments serve multiple models simultaneously.
 *   **Model Mix (example):**
     | Model | % Traffic | Tokens/sec/GPU | GPU Memory |
     |-------|-----------|----------------|------------|
-    | Claude 3 Sonnet | 40% | 200 | 40GB |
-    | Claude 3 Haiku | 35% | 800 | 15GB |
+    | Claude 4.5 Sonnet | 40% | 200 | 40GB |
+    | Claude 4.5 Haiku | 35% | 800 | 15GB |
     | Llama 70B | 15% | 150 | 70GB |
     | Titan Embeddings | 10% | 5000 | 5GB |
 *   **Packing Optimization:**
@@ -1398,7 +1398,7 @@ Detailed configuration and optimization for production deployment.
 *   **Draft Model Selection:**
     | Oracle Model | Draft Model | Acceptance Rate | Speedup |
     |--------------|-------------|-----------------|---------|
-    | Claude 3 Opus | Claude 3 Haiku | 65-75% | 2.1x |
+    | Claude 4.5 Opus | Claude 4.5 Haiku | 65-75% | 2.1x |
     | Llama 70B | Llama 7B | 60-70% | 2.3x |
     | Llama 70B | Custom distilled 1B | 70-80% | 2.8x |
     | Code Llama 34B | Code Llama 7B | 75-85% | 2.5x |
@@ -1459,7 +1459,7 @@ Detailed configuration and optimization for production deployment.
     *   Alert if acceptance rate drops significantly (model mismatch).
 
 ### Model Distillation (Future)
-*   **Problem:** Large models (Claude 3 Opus) are smart but slow/expensive. Small models (Haiku) are fast but less capable.
+*   **Problem:** Large models (Claude 4.5 Opus) are smart but slow/expensive. Small models (Haiku) are fast but less capable.
 *   **Solution:** Automated Distillation Pipeline.
     1.  User provides a dataset of complex prompts.
     2.  Bedrock runs them through the "Teacher" (Opus) to generate high-quality "Gold" responses.
@@ -1885,7 +1885,7 @@ Users need to know: "Did my fine-tuning actually help?"
 *   **Service:** `Bedrock Evaluation`.
 *   **Methodology:**
     *   **Algorithmic:** BERTScore, F1 (for fact-based QA).
-    *   **LLM-as-a-Judge:** We use a large, strong model (e.g., Claude 3 Opus) to grade the outputs of the smaller, fine-tuned model based on criteria like "Relevance" and "Coherence."
+    *   **LLM-as-a-Judge:** We use a large, strong model (e.g., Claude 4.5 Opus) to grade the outputs of the smaller, fine-tuned model based on criteria like "Relevance" and "Coherence."
 
 ### Safe Deployment Strategy (Shadow Mode)
 *   **Challenge:** How to upgrade a model version (e.g., `v1.1` -> `v1.2`) without breaking customer apps?
