@@ -13,13 +13,17 @@ This is a comprehensive, production-grade system design for **Amazon Bedrock**.
   - [Core Domain Model](#core-domain-model)
 - [Part II: The Data Plane & API Protocol](#part-ii-the-data-plane--api-protocol)
   - [Request Lifecycle](#request-lifecycle)
+    - [Speculative Guardrails Execution](#speculative-guardrails-execution)
+    - [Size-Class Isolation](#size-class-isolation-preventing-head-of-line-blocking)
   - [Advanced Rate Limiting & Traffic Management](#advanced-rate-limiting--traffic-management)
     - [Scalability: Partitioned Priority Queues](#21-scalability-partitioned-priority-queues)
     - [Resilience: Queue High Availability](#22-resilience-queue-high-availability)
   - [The Model Runner & Dynamic Batching](#the-model-runner--dynamic-batching)
+  - [KV Cache Reliability & Integrity](#kv-cache-reliability--integrity)
   - [Model Adapters (Standardization)](#model-adapters-standardization)
   - [Cold Start & Model Loading Optimization](#cold-start--model-loading-optimization)
   - [Streaming & Protocol](#streaming--protocol)
+  - [Hierarchical Backpressure & Flow Control](#hierarchical-backpressure--flow-control)
   - [API Design (The `Converse` Standard)](#api-design-the-converse-standard)
   - [Multi-Model Routing & Intelligent Fallback](#multi-model-routing--intelligent-fallback)
   - [Batch Inference API](#batch-inference-api)
@@ -33,6 +37,7 @@ This is a comprehensive, production-grade system design for **Amazon Bedrock**.
 - [Part IV: Advanced Features: RAG, Agents & Customization](#part-iv-advanced-features-rag-agents--customization)
   - [Knowledge Bases (Ingestion & Retrieval)](#knowledge-bases-ingestion--retrieval)
   - [Advanced RAG Capabilities](#advanced-rag-capabilities)
+    - [Semantic Deduplication](#7-semantic-deduplication)
   - [Agents (Orchestration Runtime)](#agents-orchestration-runtime)
   - [Agent Reliability & Production Hardening](#agent-reliability--production-hardening)
   - [The Fine-Tuning & Customization Pipeline](#the-fine-tuning--customization-pipeline)
@@ -44,10 +49,14 @@ This is a comprehensive, production-grade system design for **Amazon Bedrock**.
   - [Refined Capacity Planning](#refined-capacity-planning)
   - [Semantic Caching](#semantic-caching)
   - [Speculative Decoding](#speculative-decoding)
+    - [Speculative Decoding Deep Dive](#speculative-decoding-deep-dive)
   - [Model Distillation (Future)](#model-distillation-future)
   - [Cost Optimization & FinOps](#cost-optimization--finops)
+    - [Per-Request Cost Attribution](#31-per-request-cost-attribution)
 - [Part VI: Resilience, Scale & Operations](#part-vi-resilience-scale--operations)
   - [Global Scale & Disaster Recovery](#global-scale--disaster-recovery)
+    - [Global Traffic Management](#1-global-traffic-management)
+    - [Chaos Engineering Framework (Detailed)](#41-chaos-engineering-framework-detailed)
   - [Cell-Based Architecture](#cell-based-architecture-resilience)
   - [The "Zombie Stream" Problem](#the-zombie-stream-problem)
   - [Thundering Herd & Load Shedding](#thundering-herd--load-shedding)
@@ -118,10 +127,129 @@ The path of a single `InvokeModel` request:
     *   **Throttling:** Checks Token Bucket limits per Tenant.
     *   **Guardrail Intercept:** Runs a lightweight BERT model (<15ms) to classify prompt toxicity/PII. If unsafe, returns 400 immediately.
     *   *Implementation:* This runs on a dedicated fleet of CPU-optimized instances (c7g) to avoid wasting expensive GPU cycles on filtering.
+
+#### Speculative Guardrails Execution
+At scale, sequential guardrails become a latency bottleneck. We use speculative execution.
+
+*   **Problem:** 
+    ```
+    Sequential: Request → Guardrails (15ms) → Model Runner → Response
+    Guardrails add 15ms to every request, even though 99%+ pass.
+    ```
+
+*   **Solution: Parallel Speculative Execution**
+    ```mermaid
+    graph LR
+        Request[Request] --> G[Guardrails Check]
+        Request --> MR[Model Runner<br/>Start Generation]
+        G -->|PASS| MR
+        G -->|BLOCK| Cancel[Cancel & Return 400]
+        MR -->|If PASS| Response[Response]
+        
+    ```
+
+*   **Behavior:**
+    | Guardrails Result | Model Progress | Action |
+    |-------------------|----------------|--------|
+    | PASS (99% of cases) | Already started | Continue, zero added latency |
+    | BLOCK | ~50ms of generation | Cancel generation, return 400 |
+    | TIMEOUT | Varies | Allow request, log for review |
+
+*   **Implementation Details:**
+    *   Guardrails and Model Runner start simultaneously.
+    *   Model Runner begins inference but **buffers output** (does not stream to client).
+    *   A synchronization barrier waits for guardrails verdict (typically 15ms).
+    *   On PASS: Release buffered tokens, begin streaming to client.
+    *   On BLOCK: Send abort signal, discard partial generation, return 400.
+    *   **Race Condition Prevention:** Model Runner subscribes to guardrails result via async channel; generation and guardrails are decoupled but synchronized at the output gate.
+
+*   **Trade-offs:**
+    *   **Wasted Compute:** ~50ms of GPU time on blocked requests (0.1-1% of traffic).
+    *   **Complexity:** Requires coordination between guardrails and model runner.
+    *   **Benefit:** Eliminates 15ms from P99 latency for 99%+ of requests.
+
+*   **Guardrails Timeout Handling:**
+    *   If guardrails take > 100ms (network issue, overload): Fail open.
+    *   Log request for async review.
+    *   Alert if fail-open rate > 0.1%.
 3.  **Placement Service:**
     *   Determines if the request is **On-Demand** (Shared Pool) or **Provisioned** (Dedicated Pool).
     *   Uses **Consistent Hashing** or **Shuffle Sharding** to route to a specific healthy Cell.
     *   *Noisy Neighbor Protection:* For On-Demand, we use a "Token Bucket" algorithm per tenant at the router level. If a tenant exceeds their burst limit, they are throttled before reaching the placement service.
+
+#### Size-Class Isolation (Preventing Head-of-Line Blocking)
+Requests with vastly different token counts (100 vs. 100,000) should not compete for the same resources.
+
+*   **Problem:**
+    ```
+    Without isolation:
+    Queue: [100K tokens] [200 tokens] [150 tokens] [80K tokens]
+                 ↑
+    100K token request blocks all subsequent requests for 30+ minutes
+    ```
+
+*   **Solution: Size-Class Lanes**
+    ```mermaid
+    graph TD
+        subgraph Router["Request Router"]
+            Classify[Classify Request Size]
+        end
+        
+        Classify --> Small["Small Lane<br/>< 2K tokens<br/>Fast Lane"]
+        Classify --> Medium["Medium Lane<br/>2K-20K tokens<br/>Standard Lane"]
+        Classify --> Large["Large Lane<br/>> 20K tokens<br/>Dedicated Lane"]
+        
+        Small --> GPU1["GPU Pool<br/>50% of fleet"]
+        Medium --> GPU2["GPU Pool<br/>35% of fleet"]
+        Large --> GPU3["GPU Pool<br/>15% of fleet"]
+        
+    ```
+
+*   **Size-Class Definitions:**
+    | Class | Input Tokens | Output Estimate | Typical Latency | GPU Allocation |
+    |-------|--------------|-----------------|-----------------|----------------|
+    | Small | < 2,000 | < 500 | < 2s | 50% of fleet |
+    | Medium | 2,000-20,000 | 500-2,000 | 2-15s | 35% of fleet |
+    | Large | > 20,000 | > 2,000 | 15s-5min | 15% of fleet |
+
+*   **Classification Logic:**
+    ```
+    EstimatedCost = InputTokens + (ExpectedOutputTokens × 10)
+    
+    # Thresholds aligned with Size-Class Definitions:
+    # Small: < 2K input → EstimatedCost < ~7K (2K + 500×10)
+    # Medium: 2K-20K input → EstimatedCost 7K-25K
+    # Large: > 20K input → EstimatedCost > 25K
+    
+    if EstimatedCost < 7,000:
+        return SMALL
+    elif EstimatedCost < 25,000:
+        return MEDIUM
+    else:
+        return LARGE
+    ```
+
+*   **Dynamic Pool Rebalancing:**
+    *   Monitor queue depth per size-class.
+    *   If Small queue is empty but Medium is backed up: Temporarily reassign 10% of Small GPUs to Medium.
+    *   Rebalance every 30 seconds based on demand.
+
+*   **Overflow Handling:**
+    *   If a size-class pool is exhausted: Requests can overflow to the next larger pool.
+    *   Overflow requests are marked with lower priority in the larger pool.
+    *   Prevents complete blocking while maintaining isolation benefits.
+
+*   **Benefits:**
+    | Scenario | Without Isolation | With Isolation |
+    |----------|-------------------|----------------|
+    | Small request during heavy load | P99: 30s (blocked by large) | P99: 2s |
+    | Large request throughput | Starved by small requests | Dedicated capacity |
+    | Overall GPU utilization | 60% (fragmentation) | 85% (right-sizing) |
+
+*   **Trade-offs:**
+    *   Complexity: Additional routing logic and pool management.
+    *   Potential waste: If size-class mix is imbalanced, some pools may be underutilized.
+    *   Mitigation: Dynamic rebalancing addresses utilization concerns.
 4.  **Model Runner:** The containerized engine managing the GPU.
 
 ### Advanced Rate Limiting & Traffic Management
@@ -232,6 +360,74 @@ Standard web servers process 1 request per thread. LLMs are memory-bandwidth bou
 *   **KV Cache Management:** We use **PagedAttention**. Instead of allocating contiguous VRAM for context (which causes fragmentation), we allocate memory in blocks (pages), similar to OS virtual memory. This allows us to support 200k+ context windows efficiently.
 *   **KV Cache Offloading:** To handle extreme concurrency spikes, we implement **CPU Offloading**. When GPU VRAM is exhausted, least-recently-used KV blocks are swapped to host CPU RAM (via PCIe) rather than rejecting the request. This trades a small amount of latency for significantly higher throughput and availability.
 
+### KV Cache Reliability & Integrity
+GPU memory corruption can cause silent failures. We implement integrity checks and recovery mechanisms.
+
+#### 1. Corruption Detection (Checksumming)
+Silent memory corruption (bit flips) in KV cache leads to garbage output with no obvious error.
+
+*   **Problem:**
+    *   ECC memory catches most errors, but not all.
+    *   Soft errors from cosmic rays, power fluctuations, or aging hardware.
+    *   Corrupted KV cache produces plausible-looking but incorrect tokens.
+
+*   **Solution: Page-Level Checksumming**
+    ```mermaid
+    graph LR
+        subgraph Page["KV Cache Page (4KB)"]
+            Data["KV Data<br/>4092 bytes"]
+            CRC["CRC32 Checksum<br/>4 bytes"]
+        end
+        
+        Data --> CRC
+        
+        style Data fill:#e1f5fe
+        style CRC fill:#fff9c4
+    ```
+
+*   **Validation Points:**
+    *   On every attention computation (before reading KV values).
+    *   On CPU↔GPU swap operations.
+    *   Periodic background sweep (every 100ms for active sessions).
+
+*   **Overhead:** ~2% additional compute for checksumming (acceptable trade-off).
+*   **Why CRC32 is Sufficient:** We're detecting accidental corruption (bit flips), not adversarial attacks. CRC32 provides 1 in 4 billion false negative rate for random errors, which is adequate for hardware fault detection. For cryptographic integrity, we rely on Nitro Enclave attestation.
+
+#### 2. Corruption Recovery Strategies
+When corruption is detected, we have graduated recovery options.
+
+*   **Recovery Decision Tree:**
+    | Generation Progress | Recovery Action | Latency Impact |
+    |---------------------|-----------------|----------------|
+    | < 10% tokens generated | Restart from prompt | +100% (full redo) |
+    | 10-50% tokens | Partial recompute from last checkpoint | +50% |
+    | > 50% tokens | Continue with warning flag | Minimal |
+
+*   **Checkpoint Strategy:**
+    *   Snapshot KV cache state every 256 tokens for long generations.
+    *   Checkpoints stored in CPU RAM (not persisted to disk).
+    *   On corruption: Restore from nearest valid checkpoint, recompute forward.
+
+*   **Fallback:**
+    *   If corruption persists after retry: Mark GPU node as unhealthy.
+    *   Route request to different node.
+    *   Trigger hardware health check.
+
+#### 3. Hardware Health Monitoring
+Correlation between corruption events and hardware health.
+
+*   **Metrics Tracked:**
+    *   Corruption events per GPU per hour.
+    *   ECC correctable error counts.
+    *   Temperature and power anomalies.
+
+*   **Alerting Thresholds:**
+    *   \> 3 corruption events/hour on single GPU: Soft alert, increase monitoring.
+    *   \> 10 corruption events/hour: Remove GPU from rotation, trigger hardware diagnostics.
+    *   Correlated failures across multiple GPUs: Investigate power/cooling infrastructure.
+
+*   **Proactive Replacement:** GPUs with elevated error rates are scheduled for replacement during maintenance windows.
+
 ### Model Adapters (Standardization)
 Bedrock exposes a standardized `Converse` API, but models accept different schemas.
 *   **The Adapter Pattern:** A lightweight translation layer sitting in the Model Runner.
@@ -279,6 +475,115 @@ For infrequently used models, we trade initial latency for resource efficiency.
 *   **Protocol:** HTTP/2 over TCP with Server-Sent Events (SSE).
 *   **Why:** SSE is unidirectional and text-based, ideal for token generation.
 *   **Backpressure:** The router monitors TCP window sizes. If the client is slow, backpressure signals the Model Runner to pause generation for that specific stream, freeing up HBM bandwidth for other requests.
+
+### Hierarchical Backpressure & Flow Control
+End-to-end flow control prevents system overload and ensures graceful degradation.
+
+#### 1. Three-Layer Backpressure Architecture
+Backpressure must propagate from GPU to client to prevent wasted compute. Layer numbering follows signal flow direction (L1 = signal origin at GPU, L3 = signal destination at client).
+
+```mermaid
+graph TD
+    subgraph L1["Layer 1: Model Runner → Router"]
+        GPU[GPU signals capacity constraints]
+    end
+    
+    subgraph L2["Layer 2: Router → API Gateway"]
+        Agg[Aggregate health → region capacity]
+    end
+    
+    subgraph L3["Layer 3: API Gateway → Client SDK"]
+        AIMD[AIMD-based rate adjustment]
+    end
+    
+    GPU --> Agg
+    Agg --> AIMD
+
+```
+
+#### 2. Layer 1: Model Runner Signals
+GPU-level health indicators that trigger backpressure.
+
+*   **Signal Types:**
+    | Signal | Threshold | Meaning |
+    |--------|-----------|---------|
+    | `HEALTHY` | Queue < 50, Memory < 70% | Accept all requests |
+    | `DEGRADED` | Queue 50-100 OR Memory 70-85% | Accept with delay warning |
+    | `THROTTLE` | Queue > 100 OR Memory > 85% | Reject new requests |
+    | `CRITICAL` | Memory > 95% | Emergency shed, preempt low-priority |
+
+*   **Signal Propagation:**
+    *   Model Runner pushes state to Router every 100ms.
+    *   Router maintains weighted average (exponential smoothing, α=0.3).
+    *   Prevents oscillation from momentary spikes.
+
+#### 3. Layer 2: Router Aggregation
+Router combines signals from all Model Runners to compute region capacity.
+
+*   **Capacity Score Calculation:**
+    ```
+    RegionCapacity = Σ(NodeCapacity × NodeWeight) / Σ(NodeWeight)
+    
+    Where NodeWeight = 1.0 for healthy, 0.5 for degraded, 0 for throttled
+    ```
+
+*   **Response Headers:**
+    *   `x-amz-bedrock-capacity: 0.75` — 75% capacity available.
+    *   `x-amz-bedrock-retry-after: 5000` — Suggested retry delay (ms).
+
+*   **HTTP Status Codes:**
+    | Capacity | Response | Client Action |
+    |----------|----------|---------------|
+    | > 50% | 200 OK | Normal operation |
+    | 20-50% | 200 OK + Warning Header | Reduce request rate |
+    | 10-20% | 503 Service Unavailable | Backoff and retry |
+    | < 10% | 503 + Retry-After | Exponential backoff |
+
+#### 4. Layer 3: Client SDK AIMD Algorithm
+Additive Increase, Multiplicative Decrease for stable client behavior.
+
+*   **Algorithm:**
+    ```python
+    class AIMDController:
+        def __init__(self, initial_rate=10, min_rate=1, max_rate=1000):
+            self.rate = initial_rate  # requests per second
+            self.min_rate = min_rate
+            self.max_rate = max_rate
+        
+        def on_success(self):
+            # Additive increase: slowly ramp up
+            self.rate = min(self.rate + 1, self.max_rate)
+        
+        def on_throttle(self):
+            # Multiplicative decrease: back off quickly
+            self.rate = max(self.rate * 0.5, self.min_rate)
+        
+        def on_capacity_warning(self, capacity: float):
+            # Proportional adjustment based on reported capacity
+            if capacity < 0.5:
+                self.rate = max(self.rate * capacity, self.min_rate)
+    ```
+
+*   **Benefits:**
+    *   Prevents thundering herd on recovery (clients ramp up gradually).
+    *   Fair bandwidth allocation (all clients converge to similar rates).
+    *   Self-stabilizing (no central coordinator needed).
+
+#### 5. Backpressure for Streaming Responses
+Special handling for long-running streams.
+
+*   **Token-Level Flow Control:**
+    *   Monitor TCP send buffer fill level.
+    *   If buffer > 80% full: Pause token generation for this stream.
+    *   Resume when buffer drains to < 50%.
+
+*   **Stream Cancellation Detection:**
+    *   Periodic TCP keepalive (every 5 seconds).
+    *   On RST/FIN: Immediately abort generation, reclaim resources.
+
+*   **Priority-Aware Pausing:**
+    *   When system is stressed: Pause low-priority streams first.
+    *   High-priority streams continue uninterrupted.
 
 ### API Design (The `Converse` Standard)
 To solve the fragmentation of model inputs, we enforce a strict schema. This is the contract all Model Adapters must fulfill.
@@ -653,6 +958,98 @@ Improve retrieval by understanding user intent.
 *   **Contextual Retrieval:**
     *   Include conversation history in query embedding for follow-up questions.
 
+#### 7. Semantic Deduplication
+Prevent redundant chunks from polluting retrieval results and wasting context window.
+
+*   **Problem:**
+    ```
+    User uploads:
+    - annual_report_2024.pdf
+    - annual_report_2024_updated.pdf (80% overlap)
+    - earnings_call_transcript.txt (quotes from annual report)
+    
+    Result: Retrieval returns 3 near-identical chunks, wasting context.
+    ```
+
+*   **Solution: Multi-Stage Deduplication Pipeline**
+    ```mermaid
+    graph LR
+        A[Document<br/>Ingestion] --> B[MinHash<br/>Fingerprint]
+        B --> C[Cluster<br/>Similar]
+        C --> D[Select<br/>Representative]
+    ```
+
+*   **Stage 1: Document-Level Deduplication**
+    *   **Hash Comparison:** SHA-256 of document content.
+    *   **Action:** Exact duplicates are rejected at upload (409 Conflict).
+    *   **User Choice:** Replace existing or keep both.
+
+*   **Stage 2: Near-Duplicate Detection (MinHash/LSH)**
+    *   **MinHash Signature:** Generate k-shingle (k=5) signatures for each document.
+    *   **Similarity Threshold:** Documents with Jaccard similarity > 0.8 are flagged.
+    *   **LSH Bucketing:** Group similar documents for efficient comparison.
+    
+    ```
+    MinHash Algorithm:
+    1. Generate k-shingles (5-word sliding windows)
+    2. Apply n hash functions (n=128)
+    3. Keep minimum hash value for each function → Signature
+    4. Signature similarity ≈ Jaccard similarity of original sets
+    ```
+
+*   **Stage 3: Chunk-Level Semantic Deduplication**
+    *   **Embedding Comparison:** For chunks within flagged document groups.
+    *   **Clustering:** Hierarchical clustering of chunk embeddings.
+    *   **Representative Selection:** Keep highest-quality chunk per cluster.
+    
+    ```
+    Quality Score = (RecencyWeight × Recency) 
+                  + (SourceWeight × SourceAuthority)
+                  + (CompletenessWeight × ChunkLength)
+    ```
+
+*   **Stage 4: Query-Time Diversity**
+    *   After retrieval, apply Maximal Marginal Relevance (MMR):
+    
+    $$MMR = \arg\max_{d \in R \setminus S} \left[ \lambda \cdot Sim(d, q) - (1-\lambda) \cdot \max_{d' \in S} Sim(d, d') \right]$$
+    
+    Where:
+    *   $R$ = retrieved candidates, $S$ = selected set, $q$ = query
+    *   $\lambda$ = 0.7 (balance relevance vs. diversity)
+
+*   **Deduplication Metadata:**
+    ```json
+    {
+      "chunkId": "chunk-123",
+      "clusterId": "cluster-456",
+      "isRepresentative": true,
+      "duplicateOf": null,
+      "similarChunks": ["chunk-789", "chunk-012"],
+      "similarityScores": [0.92, 0.87],
+      "dedupDecision": "KEPT_AS_REPRESENTATIVE"
+    }
+    ```
+
+*   **User Controls:**
+    *   **Strict Mode:** Aggressive deduplication (similarity > 0.7 merged).
+    *   **Balanced Mode:** Moderate deduplication (similarity > 0.85 merged).
+    *   **Permissive Mode:** Only exact duplicates removed.
+    *   **Disabled:** Keep all chunks (for legal/compliance where every version matters).
+
+*   **Impact Metrics:**
+    | Metric | Without Dedup | With Dedup |
+    |--------|---------------|------------|
+    | Avg chunks retrieved | 10 | 10 |
+    | Unique information | 4 distinct facts | 8 distinct facts |
+    | Context efficiency | 40% | 80% |
+    | Embedding storage | 100% | 65% |
+    | Response quality | Repetitive | Diverse |
+
+*   **Edge Cases:**
+    *   **Versioned Documents:** Track version lineage; allow query by version.
+    *   **Intentional Repetition:** Mark as "keep all" via metadata tag.
+    *   **Cross-Language Duplicates:** Use multilingual embeddings for detection.
+
 ### Agents (Orchestration Runtime)
 The Agent is a serverless state machine managed by Bedrock.
 *   **State Management:**
@@ -998,6 +1395,76 @@ A technique to speed up inference without losing accuracy.
 *   **Benefit:** If the draft is correct (it often is for simple grammar), we accept 5 tokens for the cost of 1 forward pass.
 *   **Throughput:** Increases token generation speed by 2x-3x.
 
+#### Speculative Decoding Deep Dive
+Detailed configuration and optimization for production deployment.
+
+*   **Draft Model Selection:**
+    | Oracle Model | Draft Model | Acceptance Rate | Speedup |
+    |--------------|-------------|-----------------|---------|
+    | Claude 3 Opus | Claude 3 Haiku | 65-75% | 2.1x |
+    | Llama 70B | Llama 7B | 60-70% | 2.3x |
+    | Llama 70B | Custom distilled 1B | 70-80% | 2.8x |
+    | Code Llama 34B | Code Llama 7B | 75-85% | 2.5x |
+
+*   **Algorithm Details:**
+    ```
+    1. Draft Model generates K tokens speculatively (K=5 default)
+    2. Oracle Model verifies all K tokens in single forward pass
+    3. Find longest matching prefix (0 to K tokens accepted)
+    4. If < K accepted: Oracle generates next correct token
+    5. Repeat from step 1
+    
+    Expected tokens per oracle forward pass: 
+    E[tokens] = 1 + α + α² + ... + αᴷ = (1 - αᴷ⁺¹)/(1 - α)
+    
+    Where α = acceptance rate (e.g., 0.7)
+    For α=0.7, K=5: E[tokens] ≈ 2.8 tokens per pass
+    ```
+
+*   **Adaptive Speculation Depth (K):**
+    *   **High Predictability (code, structured output):** K=8
+    *   **Medium Predictability (factual text):** K=5
+    *   **Low Predictability (creative writing):** K=3 or disabled
+    *   **Dynamic Adjustment:** Track rolling acceptance rate; increase K if > 80%, decrease if < 50%.
+
+*   **When to Enable/Disable:**
+    | Scenario | Speculative Decoding | Reason |
+    |----------|---------------------|--------|
+    | JSON output mode | Enabled (K=8) | Highly predictable structure |
+    | Code generation | Enabled (K=6) | Syntax is predictable |
+    | Summarization | Enabled (K=5) | Moderate predictability |
+    | Creative writing (temp > 0.8) | Disabled | Low acceptance rate, wasted compute |
+    | Very short outputs (<20 tokens) | Disabled | Overhead exceeds benefit |
+    | Streaming with tight TTFT SLA | Enabled | Reduces time between tokens |
+
+*   **Memory Considerations:**
+    *   Draft model requires additional GPU memory (~2-5GB for 7B model).
+    *   Must fit both models in memory simultaneously.
+    *   For memory-constrained scenarios: Use smaller draft (1-3B) or disable.
+
+*   **Implementation Architecture:**
+    ```mermaid
+    graph TD
+        subgraph Runner["Model Runner"]
+            Draft["Draft Model<br/>(7B, fast)"] -->|generate K tokens| Buffer["Speculation Buffer<br/>[token₁, token₂, ..., tokenₖ]"]
+            Buffer --> Oracle["Oracle Model (70B)<br/>Verify K tokens in 1 pass"]
+            Oracle --> Decision["Accept/Reject Decision<br/>Output: accepted tokens"]
+        end
+        
+        Decision -->|accepted| Output[Response Stream]
+        Decision -->|rejected| Draft
+        
+        style Draft fill:#c8e6c9
+        style Oracle fill:#ffcdd2
+        style Buffer fill:#fff9c4
+    ```
+
+*   **Metrics & Monitoring:**
+    *   `SpeculativeAcceptanceRate`: Target > 60%.
+    *   `TokensPerOraclePass`: Efficiency metric.
+    *   `SpeculativeOverheadMs`: Time spent in draft model.
+    *   Alert if acceptance rate drops significantly (model mismatch).
+
 ### Model Distillation (Future)
 *   **Problem:** Large models (Claude 3 Opus) are smart but slow/expensive. Small models (Haiku) are fast but less capable.
 *   **Solution:** Automated Distillation Pipeline.
@@ -1038,6 +1505,88 @@ Enterprise customers need granular cost visibility for internal billing.
     *   Anomaly detection alerts when spending exceeds 2σ from baseline.
 *   **Budget Actions:** Automatic throttling or notifications when spend approaches limits.
 
+#### 3.1 Per-Request Cost Attribution
+Token-level cost tracking for precise showback/chargeback.
+
+*   **Cost Attribution Record (Per Request):**
+    ```json
+    {
+      "requestId": "req-abc123",
+      "tenantId": "tenant-456",
+      "timestamp": "2024-12-03T10:30:00Z",
+      "modelId": "anthropic.claude-3-sonnet",
+      "usage": {
+        "inputTokens": 2000,
+        "outputTokens": 500,
+        "cachedInputTokens": 500,
+        "ragChunksRetrieved": 5
+      },
+      "latency": {
+        "guardrailsMs": 12,
+        "retrievalMs": 45,
+        "prefillMs": 150,
+        "decodeMs": 2500,
+        "totalMs": 2707
+      },
+      "costs": {
+        "inputTokenCost": "$0.0030",
+        "outputTokenCost": "$0.0075",
+        "cacheSavings": "-$0.0005",
+        "ragCost": "$0.0002",
+        "computeOverhead": "$0.0008",
+        "totalCost": "$0.0110"
+      },
+      "metadata": {
+        "costCenter": "engineering",
+        "project": "chatbot-v2",
+        "environment": "production",
+        "userId": "user-789"
+      }
+    }
+    ```
+
+*   **Cost Calculation Formula:**
+    ```
+    TotalCost = (InputTokens × InputPrice) 
+              + (OutputTokens × OutputPrice × OutputMultiplier)
+              + (RAGChunks × RAGPrice)
+              + (AgentToolCalls × ToolPrice)
+              - (CachedTokens × CacheDiscount)
+    
+    Where OutputMultiplier accounts for compute-intensity of decoding.
+    ```
+
+*   **Real-Time Cost Streaming:**
+    *   Costs streamed to Kinesis in real-time.
+    *   Aggregated every minute to cost ledger (DynamoDB).
+    *   Available for query within 5 minutes of request completion.
+
+*   **Cost Dimensions for Analysis:**
+    | Dimension | Use Case |
+    |-----------|----------|
+    | By Tenant | Multi-tenant billing |
+    | By Cost Center | Internal chargeback |
+    | By Model | Model economics analysis |
+    | By Feature | RAG vs. direct inference |
+    | By Time | Usage trending |
+    | By User | Individual accountability |
+
+*   **Cost Anomaly Detection:**
+    *   ML model trained on historical spend patterns.
+    *   Alerts for:
+        *   Single request cost > $1 (unusual).
+        *   Tenant daily spend > 3σ from baseline.
+        *   Model cost spike (potential inefficient prompts).
+    *   Automatic investigation ticket created.
+
+*   **Showback Dashboard:**
+    *   Real-time cost per conversation.
+    *   Cost breakdown by component (inference, RAG, caching).
+    *   Optimization recommendations:
+        *   "Enable semantic caching to save $2.3K/month."
+        *   "Reduce system prompt by 1000 tokens to save $800/month."
+        *   "Consider Claude Haiku for simple queries (70% cost reduction)."
+
 #### 4. Reserved Capacity & Savings Plans
 For predictable workloads, committed usage provides significant discounts.
 *   **Provisioned Throughput Reservations:**
@@ -1059,7 +1608,63 @@ Automatically optimize for cost when latency SLOs permit.
 ### Global Scale & Disaster Recovery
 To ensure 99.99% availability, Bedrock operates on a multi-region active-active basis.
 
-#### 1. Recovery Objectives (SLA Commitments)
+#### 1. Global Traffic Management
+Pure latency-based routing is insufficient; we need capacity-aware global routing.
+
+*   **Problem:** Route 53 latency-based routing will send traffic to an overloaded region.
+*   **Solution:** Weighted latency routing that considers both latency AND available capacity.
+
+*   **Architecture:**
+    ```mermaid
+    graph TD
+        subgraph Global["Global Edge Layer"]
+            R53["Route 53<br/>Weighted Latency"]
+            GCS["Global Capacity Service<br/>• Aggregates region health<br/>• Publishes weight updates<br/>• Every 10 seconds"]
+            GCS -->|weights| R53
+        end
+        
+        R53 --> RA["Region A<br/>Capacity Service"]
+        R53 --> RB["Region B<br/>Capacity Service"]
+        
+        RA --> CA["Cell Clusters"]
+        RB --> CB["Cell Clusters"]
+        
+        CA -->|health| RA
+        CB -->|health| RB
+        RA -->|report| GCS
+        RB -->|report| GCS
+        
+        style Global fill:#e3f2fd
+        style R53 fill:#bbdefb
+        style GCS fill:#c5cae9
+    ```
+
+*   **Capacity Service Responsibilities:**
+    *   **Regional Aggregation:** Each region reports: GPU utilization, queue depth, error rate, active connections.
+    *   **Weight Calculation:**
+        ```
+        Weight = BaseWeight × (1 - UtilizationPenalty) × HealthMultiplier
+        
+        Where:
+        - UtilizationPenalty = max(0, (Utilization - 0.7) × 2)  // Penalize above 70%
+        - HealthMultiplier = 1.0 if healthy, 0.5 if degraded, 0 if unhealthy
+        ```
+    *   **Publication:** Push updated weights to Route 53 every 10 seconds.
+
+*   **Failover Behavior:**
+    | Region State | Weight | Behavior |
+    |--------------|--------|----------|
+    | Healthy (<70% util) | 100 | Full traffic eligible |
+    | Busy (70-90% util) | 50 | Reduced traffic share |
+    | Stressed (>90% util) | 10 | Emergency overflow only |
+    | Unhealthy | 0 | No traffic routed |
+
+*   **Client-Side Hedging (SDK):**
+    *   For critical requests, SDK can send to 2 regions simultaneously.
+    *   Return first response, cancel the other.
+    *   Trade-off: 2x cost for guaranteed low latency.
+
+#### 2. Recovery Objectives (SLA Commitments)
 Concrete targets that drive architectural decisions:
 
 | Tier | Workload Type | RTO | RPO | Availability |
@@ -1072,12 +1677,12 @@ Concrete targets that drive architectural decisions:
 *   **RPO (Recovery Point Objective):** Maximum acceptable data loss.
 *   **In-Flight Request Handling:** Requests in progress during failure are automatically retried by the client SDK (with idempotency keys).
 
-#### 2. Control Plane Replication
+#### 3. Control Plane Replication
 *   **Global Tables:** Configuration data (Provisioned Throughput, Guardrails, Knowledge Bases) is stored in DynamoDB Global Tables.
 *   **Replication:** Changes made in `us-east-1` are replicated to `us-west-2`, `eu-central-1`, etc., within 1 second.
 *   **Benefit:** If `us-east-1` Control Plane goes down, users can immediately manage resources in `us-west-2`.
 
-#### 3. Data Plane Failover
+#### 4. Data Plane Failover
 *   **Statelessness:** Since inference is stateless, we can route traffic anywhere.
 *   **DNS Steering:** Route 53 Health Checks monitor the `InvokeModel` endpoint in each region.
 *   **Failover Logic:**
@@ -1086,7 +1691,7 @@ Concrete targets that drive architectural decisions:
     3.  If Region A fails health checks (e.g., high latency or 5xx errors), Route 53 updates DNS to point to Region B.
     4.  **Cross-Region Inference:** For critical workloads, customers can configure "Cross-Region Inference Profiles" which automatically route requests to a backup region if the primary is out of capacity.
 
-#### 4. Chaos Engineering & GameDays
+#### 5. Chaos Engineering & GameDays
 Proactive resilience testing through controlled failure injection.
 *   **Failure Scenarios Tested:**
     *   Single GPU node failure.
@@ -1099,7 +1704,73 @@ Proactive resilience testing through controlled failure injection.
 *   **Cadence:** Weekly automated tests, monthly GameDays with engineering teams.
 *   **Blast Radius Controls:** Start with 1% of traffic, gradually increase.
 
-#### 5. Circuit Breaker Patterns
+#### 5.1 Chaos Engineering Framework (Detailed)
+A comprehensive chaos testing strategy for LLM-specific failure modes.
+
+*   **LLM-Specific Failure Scenarios:**
+    | Failure Type | Injection Method | Expected Behavior | Validation |
+    |--------------|------------------|-------------------|------------|
+    | GPU Node Death | EC2 terminate | Requests failover; no user error | Zero 5xx increase |
+    | GPU OOM | Allocate dummy tensors | Graceful rejection; 503 | Request retried successfully |
+    | KV Cache Corruption | Inject bad bytes | Checksum fails; restart | Correct output after recovery |
+    | Model Weight Corruption | Flip bits in memory | Validation fails; reload | Model serves correctly post-reload |
+    | Network Partition (Cell) | iptables block | Cell marked unhealthy | Traffic reroutes in <30s |
+    | Slow Guardrails | Add 500ms delay | Fail-open; request proceeds | Logged for review |
+    | Thundering Herd | Synthetic 100x spike | Rate limiting engages | P0 requests unaffected |
+    | Zombie Stream | Client disconnect | Generation aborts | GPU resources freed |
+    | KMS Unavailable | Block KMS endpoint | New encryption fails; cached keys work | Graceful degradation |
+    | OpenSearch Down | Kill OpenSearch | RAG disabled; model-only responses | Response with warning |
+
+*   **Chaos Test Automation:**
+    ```yaml
+    # Example FIS Experiment Template
+    chaos_experiment:
+      name: "gpu-node-failure"
+      targets:
+        - type: "ec2:instance"
+          filters:
+            - key: "tag:Role"
+              value: "model-runner"
+          selection_mode: "COUNT(1)"
+      
+      actions:
+        - name: "terminate-instance"
+          type: "aws:ec2:terminate-instances"
+          duration: "PT0S"
+      
+      stop_conditions:
+        - source: "aws:cloudwatch:alarm"
+          alarm_arn: "arn:aws:cloudwatch:...:error-rate-alarm"
+      
+      validation:
+        - metric: "InvocationErrors"
+          threshold: "< 0.01%"
+          window: "5m"
+    ```
+
+*   **Progressive Blast Radius:**
+    | Phase | Scope | Duration | Criteria to Proceed |
+    |-------|-------|----------|---------------------|
+    | 1 | Single node | 5 min | Zero customer-visible errors |
+    | 2 | 10% of cell | 10 min | Error rate < 0.1% |
+    | 3 | Full cell | 15 min | SLA metrics maintained |
+    | 4 | Cross-cell | 30 min | Failover < 30 seconds |
+    | 5 | Full region | GameDay | DR procedures validated |
+
+*   **GameDay Runbook:**
+    1.  **Pre-GameDay:** Notify stakeholders, prepare rollback procedures.
+    2.  **War Room:** Engineering, SRE, and support teams co-located.
+    3.  **Execution:** Run scenarios with increasing severity.
+    4.  **Observation:** Monitor dashboards, collect metrics.
+    5.  **Post-Mortem:** Document findings, create action items.
+    6.  **Follow-Up:** Implement fixes, re-test in next GameDay.
+
+*   **Automated Chaos in CI/CD:**
+    *   Every deployment triggers mini chaos tests.
+    *   Block deployment if chaos tests fail.
+    *   Ensures resilience doesn't regress.
+
+#### 6. Circuit Breaker Patterns
 Prevent cascade failures when dependencies are unhealthy.
 *   **Implementation:**
     *   **Closed State:** Normal operation; requests flow through.
@@ -1113,7 +1784,7 @@ Prevent cascade failures when dependencies are unhealthy.
     *   KMS (encryption) - fallback: reject request rather than process unencrypted.
     *   Metering service - fallback: queue locally, replay later (never block inference).
 
-#### 6. Graceful Degradation Modes
+#### 7. Graceful Degradation Modes
 When capacity is constrained, shed load intelligently.
 *   **Level 1 (Mild Stress):**
     *   Disable semantic caching writes (reads continue).
