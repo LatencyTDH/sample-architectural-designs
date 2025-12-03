@@ -3,7 +3,7 @@ This is a comprehensive, production-grade system design for **Amazon Bedrock**.
 ---
 
 # System Design: Amazon Bedrock
-**A Serverless, Fully Managed Foundation Model Platform**
+A Serverless, Fully Managed Foundation Model Platform
 
 ## Table of Contents
 
@@ -91,11 +91,11 @@ This is a comprehensive, production-grade system design for **Amazon Bedrock**.
 ### The "Serverless" Abstraction
 Bedrock abstracts the physical GPU/Accelerator layer. The user interacts with an API, not a cluster.
 *   **Stateless:** All requests are stateless.
-*   **Unified Interface:** A single `InvokeModel` API for disparate models (Claude, Llama, Titan, Stable Diffusion).
+*   **Unified Interface:** A single `InvokeModel` API for disparate models (Claude, DeepSeek, Titan, Stable Diffusion).
 *   **Multi-Tenant:** The system must maximize hardware utilization by interleaving requests from different users onto shared model weights, while strictly isolating data.
 
 ### High-Level Architecture
-We strictly separate the **Control Plane** (Resource Management) from the **Data Plane** (Inference).
+We strictly separate the **Control Plane** (Resource Management) from the **Data Plane** (Inference). See the [Regional Component Architecture](#regional-component-architecture) diagram for a visual representation.
 
 1.  **Control Plane:**
     *   Manages account entitlements, throughput provisioning, fine-tuning jobs, and knowledge base configurations.
@@ -119,7 +119,7 @@ We strictly separate the **Control Plane** (Resource Management) from the **Data
 ## Part II: The Data Plane & API Protocol
 
 ### Request Lifecycle
-The path of a single `InvokeModel` request:
+The path of a single `InvokeModel` request. See the [Inference Sequence (Streaming)](#inference-sequence-streaming) diagram for the full flow.
 
 1.  **Ingress (PrivateLink):** Request enters via VPC Endpoint to ensure traffic never traverses the public internet.
 2.  **Front-End Router (The Gateway):**
@@ -253,7 +253,7 @@ Requests with vastly different token counts (100 vs. 100,000) should not compete
 4.  **Model Runner:** The containerized engine managing the GPU.
 
 ### Advanced Rate Limiting & Traffic Management
-Simple token buckets are insufficient for production LLM workloads with variable request costs.
+Simple token buckets are insufficient for production LLM workloads with variable request costs. See the [Advanced Rate Limiting Architecture](#advanced-rate-limiting-architecture) diagram.
 
 #### 1. Adaptive Rate Limiting
 Static limits don't account for real-time system capacity.
@@ -286,7 +286,7 @@ A single queue becomes a bottleneck at scale. We partition while preserving prio
 
 *   **Partitioning Strategy:**
     *   **By Cell:** Each Cell (500 GPU nodes) has its own priority queue.
-    *   **By Model:** Hot models (Claude, Llama 70B) get dedicated queue partitions.
+    *   **By Model:** Hot models (Claude, DeepSeek-V3) get dedicated queue partitions.
     *   **Partition Key:** `hash(TenantID + ModelID) % NumPartitions`
 *   **Local vs. Global Priority:**
     *   Each partition maintains local priority ordering.
@@ -430,13 +430,13 @@ Bedrock exposes a standardized `Converse` API, but models accept different schem
 *   **The Adapter Pattern:** A lightweight translation layer sitting in the Model Runner.
     *   *Input:* Converts Bedrock JSON (`{"messages": [...]}`) -> Model specific tensor/prompt (`<|begin_of_text|>...`).
     *   *Output:* Converts raw Logits -> Bedrock JSON chunks.
-*   **Benefit:** Enables swapping Llama for Claude without changing application code.
+*   **Benefit:** Enables swapping DeepSeek for Claude without changing application code.
 
 ### Cold Start & Model Loading Optimization
-Loading a 70B+ parameter model into GPU memory is a critical latency bottleneck. Without optimization, cold starts can take 30-60 seconds.
+Loading a 70B+ parameter model into GPU memory is a critical latency bottleneck. Without optimization, cold starts can take 30-60 seconds. See the [Cold Start & Model Loading](#cold-start--model-loading) diagram.
 
 #### 1. Model Preloading Strategy
-*   **Always-Warm Pools:** For high-demand models (Claude, Llama 70B), maintain a minimum fleet with models already loaded.
+*   **Always-Warm Pools:** For high-demand models (Claude, DeepSeek-V3), maintain a minimum fleet with models already loaded.
 *   **Popularity-Based Warming:** Track invocation frequency; keep top 10 models per region permanently warm.
 *   **Tenant Affinity:** For Provisioned Throughput customers, dedicate specific nodes that never unload their model.
 
@@ -648,7 +648,7 @@ POST /model/{modelId}/converse
 ```
 
 ### Multi-Model Routing & Intelligent Fallback
-Production systems require resilience beyond single-model invocations.
+Production systems require resilience beyond single-model invocations. See the [Multi-Model Routing & Fallback Flow](#multi-model-routing--fallback-flow) diagram.
 
 #### 1. Smart Model Selection (Routing)
 Not all prompts require the most powerful (and expensive) model.
@@ -670,7 +670,7 @@ When the primary model is unavailable or overloaded, automatically try alternati
       "primaryModel": "anthropic.claude-3-sonnet",
       "fallbackChain": [
         { "model": "anthropic.claude-3-haiku", "condition": "THROTTLED" },
-        { "model": "meta.llama3-70b", "condition": "UNAVAILABLE" },
+        { "model": "deepseek.deepseek-v3", "condition": "UNAVAILABLE" },
         { "model": "amazon.titan-text-premier", "condition": "ANY_ERROR" }
       ],
       "fallbackBehavior": "AUTOMATIC" | "NOTIFY_ONLY"
@@ -704,7 +704,7 @@ For critical applications, run multiple models and synthesize results.
 *   **Cost Consideration:** 3x inference cost; use sparingly for high-value decisions.
 
 ### Batch Inference API
-For cost-sensitive, latency-tolerant workloads, batch processing offers significant savings.
+For cost-sensitive, latency-tolerant workloads, batch processing offers significant savings. See the [Batch Inference Architecture](#batch-inference-architecture) diagram.
 
 #### 1. API Design
 ```json
@@ -774,7 +774,7 @@ GET /batch-inference-jobs/{jobId}
 This is the most critical architectural component for enterprise trust.
 
 ### Nitro Enclaves & Model Weight Security
-Problem: 3rd Party Model Providers (e.g., Anthropic) do not want AWS or customers to steal their weights. Customers do not want Anthropic to see their prompts.
+Problem: 3rd Party Model Providers (e.g., Anthropic) do not want AWS or customers to steal their weights. Customers do not want Anthropic to see their prompts. See the [Nitro Enclave "Clean Room" Flow](#nitro-enclave-clean-room-flow) diagram.
 
 **Solution: The Nitro Enclave**
 1.  **Boot:** The compute instance launches a Nitro Enclave (isolated CPU/Memory, no persistent storage, no SSH).
@@ -807,7 +807,7 @@ Problem: 3rd Party Model Providers (e.g., Anthropic) do not want AWS or customer
 *   **Model Access Logging:** For high-security environments, we log the *hash* of the prompt and response to ensure non-repudiation without storing the actual sensitive text.
 
 ### LLM-Specific Security Hardening
-Traditional security models don't address LLM-specific attack vectors.
+Traditional security models don't address LLM-specific attack vectors. See the [LLM Security Hardening Flow](#llm-security-hardening-flow) diagram.
 
 #### 1. Prompt Injection Detection
 Adversaries attempt to override system instructions via user input.
@@ -868,7 +868,7 @@ Prevent adversaries from stealing model capabilities through API queries.
 ## Part IV: Advanced Features: RAG, Agents & Customization
 
 ### Knowledge Bases (Ingestion & Retrieval)
-RAG requires two asynchronous pipelines.
+RAG requires two asynchronous pipelines. See the [RAG Ingestion Pipeline](#rag-ingestion-pipeline) diagram.
 
 1.  **Ingestion (Control Plane):**
     *   **Watcher:** EventBridge listens to S3 bucket changes.
@@ -879,7 +879,7 @@ RAG requires two asynchronous pipelines.
     *   Bedrock intercepts the prompt -> Calls `Titan Embeddings` -> Queries OpenSearch (Approximate Nearest Neighbor) -> Injects context into prompt -> Calls LLM.
 
 ### Advanced RAG Capabilities
-Production RAG systems require sophisticated retrieval beyond basic vector search.
+Production RAG systems require sophisticated retrieval beyond basic vector search. See the [Hybrid RAG Retrieval Pipeline](#hybrid-rag-retrieval-pipeline) diagram.
 
 #### 1. Hybrid Search (Vector + Keyword)
 Pure vector search misses exact matches; pure keyword search misses semantics.
@@ -1048,7 +1048,8 @@ Prevent redundant chunks from polluting retrieval results and wasting context wi
     *   **Cross-Language Duplicates:** Use multilingual embeddings for detection.
 
 ### Agents (Orchestration Runtime)
-The Agent is a serverless state machine managed by Bedrock.
+The Agent is a serverless state machine managed by Bedrock. See the [Agent Orchestration with HITL](#agent-orchestration-with-hitl) diagram.
+
 *   **State Management:**
     *   Session state (conversation history, current variables) is stored in **DynamoDB** with a Time-To-Live (TTL).
     *   This allows the Lambda functions to be stateless and the orchestration to pause/resume over long periods (e.g., waiting for a human approval step).
@@ -1151,7 +1152,7 @@ Deep visibility into agent behavior.
     *   Alert on unusual patterns (loops, repeated failures, excessive tool calls).
 
 ### The Fine-Tuning & Customization Pipeline
-While inference is the high-frequency path, fine-tuning is the high-complexity path. We must allow users to adapt models (e.g., Llama 3) to their data without leaking that data or the base model weights.
+While inference is the high-frequency path, fine-tuning is the high-complexity path. We must allow users to adapt models (e.g., DeepSeek-V3) to their data without leaking that data or the base model weights. See the [Fine-Tuning Pipeline Architecture](#fine-tuning-pipeline-architecture) diagram.
 
 #### 1. Architecture: The Job Orchestrator
 Fine-tuning is asynchronous and long-running (hours/days).
@@ -1177,7 +1178,7 @@ Full fine-tuning updates all 70B parameters, which is cost-prohibitive and requi
 4.  **Finalization:** The final Adapter weights are encrypted with the User's KMS key and stored in their S3 bucket.
 
 ### Model Versioning & Governance
-Enterprise model lifecycle management for custom models.
+Enterprise model lifecycle management for custom models. See the [Model Versioning & Governance Workflow](#model-versioning--governance-workflow) diagram.
 
 #### 1. Model Registry
 Central catalog for all custom models within an organization.
@@ -1273,7 +1274,7 @@ Share custom models across AWS accounts within an organization.
 ## Part V: Infrastructure, Economics & Optimization
 
 ### Hardware Strategy (H100, Trainium, Inferentia)
-*   **Nvidia H100s:** Used for the largest, most complex 3rd party models (Llama 70B, Claude).
+*   **Nvidia H100s:** Used for the largest, most complex 3rd party models (DeepSeek-V3, Claude).
 *   **AWS Trainium/Inferentia:** Used for 1st party models (Titan) and embeddings.
     *   *Economics:* AWS chips are 40% cheaper per inference.
 *   **Quantization:** We heavily utilize FP8 (8-bit floating point) quantization to double the effective VRAM capacity and throughput with negligible accuracy loss.
@@ -1288,7 +1289,7 @@ Share custom models across AWS accounts within an organization.
 *   **Total Load:** $10^7$ requests/day.
 *   **Avg TPS (Tokens Per Second):** $(10^7 \times 1000) / 86400 \approx 115,000$ TPS.
 *   **Peak TPS:** 10x multiplier = 1,150,000 TPS.
-*   **Hardware Capacity (Llama 70B on 2xH100):**
+*   **Hardware Capacity (DeepSeek-V3 on 8xH100):**
     *   Max throughput per node (with batching): ~3,000 TPS.
 *   **Fleet Size:** $1,150,000 / 3,000 \approx 383$ Node Pairs.
 *   **Memory Constraint:**
@@ -1359,8 +1360,8 @@ Real deployments serve multiple models simultaneously.
     | Model | % Traffic | Tokens/sec/GPU | GPU Memory |
     |-------|-----------|----------------|------------|
     | Claude 4.5 Sonnet | 40% | 200 | 40GB |
-    | Claude 4.5 Haiku | 35% | 800 | 15GB |
-    | Llama 70B | 15% | 150 | 70GB |
+    | Claude 4.5 Haiku | 35% | 800 | 12GB |
+    | DeepSeek-V3 | 15% | 150 | 80GB |
     | Titan Embeddings | 10% | 5000 | 5GB |
 *   **Packing Optimization:**
     *   Co-locate small models (Haiku + Embeddings) on same GPU.
@@ -1378,7 +1379,8 @@ Combining all factors for the original scenario:
 *   **With Reserved Instances (50% discount):** ~$7.5M/month.
 
 ### Semantic Caching
-LLM inference is deterministic (mostly) and expensive. If User A asks "What is the capital of France?" and User B asks the same 1 second later, we shouldn't re-run the GPU.
+LLM inference is deterministic (mostly) and expensive. If User A asks "What is the capital of France?" and User B asks the same 1 second later, we shouldn't re-run the GPU. See the [Semantic Caching Logic](#semantic-caching-logic) diagram.
+
 *   **Layer:** Redis / ElastiCache (Vector Enabled).
 *   **Logic:**
     1.  Embed the incoming prompt using a small, fast model (Titan Embeddings).
@@ -1388,7 +1390,7 @@ LLM inference is deterministic (mostly) and expensive. If User A asks "What is t
 
 ### Speculative Decoding
 A technique to speed up inference without losing accuracy.
-*   **Concept:** A small "Draft Model" (e.g., Llama-7B) generates 5 tokens ahead. The "Oracle Model" (Llama-70B) validates them in parallel.
+*   **Concept:** A small "Draft Model" (e.g., DeepSeek-V3-Lite) generates 5 tokens ahead. The "Oracle Model" (DeepSeek-V3) validates them in parallel.
 *   **Benefit:** If the draft is correct (it often is for simple grammar), we accept 5 tokens for the cost of 1 forward pass.
 *   **Throughput:** Increases token generation speed by 2x-3x.
 
@@ -1399,9 +1401,9 @@ Detailed configuration and optimization for production deployment.
     | Oracle Model | Draft Model | Acceptance Rate | Speedup |
     |--------------|-------------|-----------------|---------|
     | Claude 4.5 Opus | Claude 4.5 Haiku | 65-75% | 2.1x |
-    | Llama 70B | Llama 7B | 60-70% | 2.3x |
-    | Llama 70B | Custom distilled 1B | 70-80% | 2.8x |
-    | Code Llama 34B | Code Llama 7B | 75-85% | 2.5x |
+    | DeepSeek-V3 | DeepSeek-V3-Lite | 60-70% | 2.3x |
+    | DeepSeek-V3 | Custom distilled 1B | 70-80% | 2.8x |
+    | DeepSeek-Coder-V2 | DeepSeek-Coder-V2-Lite | 75-85% | 2.5x |
 
 *   **Algorithm Details:**
     ```
@@ -1599,7 +1601,7 @@ Automatically optimize for cost when latency SLOs permit.
 ## Part VI: Resilience, Scale & Operations
 
 ### Global Scale & Disaster Recovery
-To ensure 99.99% availability, Bedrock operates on a multi-region active-active basis.
+To ensure 99.99% availability, Bedrock operates on a multi-region active-active basis. See the [Global Multi-Region Architecture](#global-multi-region-architecture) diagram for a visual overview.
 
 #### 1. Global Traffic Management
 Pure latency-based routing is insufficient; we need capacity-aware global routing.
@@ -1800,7 +1802,7 @@ When capacity is constrained, shed load intelligently.
 *   **Design Fix:** The Model Runner must periodically check the **TCP socket health** (every 5-10 tokens). If the socket is closed, it sends an `Abort` signal to the inference engine to halt generation immediately.
 
 ### Thundering Herd & Load Shedding
-*   **Scenario:** A region recovers from an outage; all clients retry simultaneously.
+*   **Scenario:** A region recovers from an outage; all clients retry simultaneously. See the [Disaster Recovery & Circuit Breaker](#disaster-recovery--circuit-breaker) diagram.
 *   **Defense:**
     1.  **Jitter:** Clients must use exponential backoff with jitter.
     2.  **L7 Load Shedding:** The Front-End Router monitors queue depth. If queue > X, it immediately rejects new requests with HTTP 503 (Overloaded) rather than letting them timeout in the queue (which wastes resources).
@@ -1824,7 +1826,7 @@ In a generative AI system, "success" is harder to define than in standard web ap
     *   We inject a `RequestID` that propagates from the API Gateway -> Router -> Model Runner -> Enclave. This allows us to debug "Why did this specific prompt take 10 seconds?"
 
 ### Advanced LLM Observability
-Beyond standard metrics, LLMs require domain-specific monitoring.
+Beyond standard metrics, LLMs require domain-specific monitoring. See the [Observability & Drift Detection](#observability--drift-detection) diagram.
 
 #### 1. Semantic Drift Detection
 Model behavior can change subtly over time, even without explicit updates.
@@ -2151,7 +2153,7 @@ graph TD
     
     subgraph "Partitioned Priority Queues"
         Select --> P1[Partition 1<br/>Cell A + Claude]
-        Select --> P2[Partition 2<br/>Cell A + Llama]
+        Select --> P2[Partition 2<br/>Cell A + DeepSeek]
         Select --> P3[Partition 3<br/>Cell B + Claude]
         Select --> PN[Partition N...]
         
