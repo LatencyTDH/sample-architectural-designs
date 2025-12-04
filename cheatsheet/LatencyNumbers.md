@@ -2,19 +2,22 @@
 
 A quick reference for system design interviews and back-of-the-envelope calculations.
 
-> **Note**: These numbers are approximations for mental math. Real performance varies by hardware, workload, and conditions. I/O and network numbers are from [sirupsen/napkin-math](https://github.com/sirupsen/napkin-math) benchmarks (Intel Xeon E-2236). CPU/cache latencies are well-established values that haven't changed significantly in modern processors.
+> **Note**: These numbers are approximations for mental math. Real performance varies by hardware, workload, and conditions. Numbers are compiled from multiple sources including vendor specs, academic papers, and industry benchmarks. CPU/cache latencies are well-established; storage numbers reflect typical enterprise NVMe SSDs (PCIe 4.0); memory assumes DDR5.
 
 ## CPU & Memory
 
 | Operation | Latency |
 |-----------|---------|
 | L1 cache reference | ~1 ns |
-| Branch mispredict | ~3 ns |
+| Branch mispredict | ~3-5 ns |
 | L2 cache reference | ~4 ns |
-| Mutex lock/unlock | ~17 ns |
-| Main memory reference | ~100 ns |
-| Sequential memory R/W (64 bytes) | 0.5 ns |
-| Random memory R/W (64 bytes) | 50 ns |
+| L3 cache reference | ~10-20 ns |
+| Mutex lock/unlock | ~15-25 ns |
+| Main memory reference (DDR5) | ~80-100 ns |
+| Sequential memory R/W (64 bytes) | ~0.5 ns |
+| Random memory R/W (64 bytes) | ~50 ns |
+
+> **Memory bandwidth (2025)**: DDR5-6400 delivers ~50 GB/s per channel (typically 2-8 channels).
 
 ## Hashing & Crypto
 
@@ -40,18 +43,20 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 
 ## Storage I/O
 
-| Operation | Latency |
-|-----------|---------|
-| Sequential SSD read (8KB) | 1 µs |
-| Random SSD read (8KB) | 100 µs |
-| Sequential SSD write (8KB, no fsync) | 10 µs |
-| Sequential SSD write (8KB, +fsync) | 1 ms |
-| Read 1MB sequentially from memory | ~100 µs |
-| Read 1MB sequentially from SSD | 1 ms |
-| Read 1MB sequentially from HDD | 5 ms |
-| HDD seek time (7200 RPM) | 8-9 ms |
-| HDD rotational latency (7200 RPM) | 4 ms avg |
-| Random HDD read (8KB) | 12-13 ms |
+| Operation | Latency | Throughput |
+|-----------|---------|------------|
+| Sequential NVMe SSD read (4KB) | ~10 µs | 5-7 GB/s |
+| Sequential NVMe SSD write (4KB, no fsync) | ~10 µs | 4-6 GB/s |
+| Sequential NVMe SSD write (4KB, +fsync) | ~1 ms | ~50 MB/s |
+| Random NVMe SSD read (4KB) | ~100 µs | ~500 MB/s |
+| Random NVMe SSD write (4KB) | ~20 µs | ~300 MB/s |
+| Sequential HDD read | ~5 ms | 150-250 MB/s |
+| Random HDD read (4KB) | ~10 ms | ~1 MB/s |
+| Read 1 MB sequentially from memory | ~20 µs | ~50 GB/s |
+| Read 1 MB sequentially from NVMe SSD | ~150-200 µs | 5-7 GB/s |
+| Read 1 MB sequentially from HDD | ~5 ms | ~200 MB/s |
+
+> **Note on SSDs**: PCIe 4.0 NVMe SSDs typically achieve 5-7 GB/s sequential reads. PCIe 5.0 can reach 10+ GB/s. SATA SSDs are limited to ~550 MB/s.
 
 ## Network
 
@@ -99,15 +104,17 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 ## Key Takeaways
 
 1. **Memory is fast** — L1 cache is ~100x faster than main memory
-2. **SSDs changed everything** — Random reads went from ~13ms (HDD) to 100µs (SSD)
+2. **NVMe changed everything** — Random reads went from ~10ms (HDD) to ~100µs (NVMe)
 3. **Network is the bottleneck** — Even same-datacenter RTT is ~500µs
 4. **Crypto is expensive** — Bcrypt is intentionally slow (~300ms) for security
 5. **Context switches add up** — At ~10µs each, they matter at high throughput
-6. **fsync is costly** — SSD writes jump from 10µs to 1ms with durability guarantees
-7. **HDD = seek + rotation** — 8-9ms seek + 4ms rotation = ~12-13ms random access
+6. **fsync is costly** — SSD writes jump from ~10µs to ~1ms with durability guarantees
+7. **Sequential >> Random** — Sequential I/O can be 100x+ faster than random
 
 ## References
 
-- [sirupsen/napkin-math](https://github.com/sirupsen/napkin-math) — Modern benchmarks on real hardware (primary source)
-- [Napkin Math talk at SRECON](https://www.youtube.com/watch?v=IxkSlnrRFqc)
-- [Systems Performance by Brendan Gregg](https://www.brendangregg.com/systems-performance-2nd-edition-book.html)
+- [Jeff Dean's original latency numbers](https://gist.github.com/jboner/2841832) — Classic reference (2012 baseline)
+- [Systems Performance by Brendan Gregg](https://www.brendangregg.com/systems-performance-2nd-edition-book.html) — Authoritative systems book
+- [sirupsen/napkin-math](https://github.com/sirupsen/napkin-math) — Benchmarks and estimation techniques
+- [Apple Silicon CPU Optimization Guide](https://developer.apple.com/documentation/apple-silicon/) — Modern CPU latencies
+- [NVMe specifications](https://nvmexpress.org/specifications/) — Official NVMe standards

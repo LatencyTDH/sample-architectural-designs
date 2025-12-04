@@ -481,15 +481,15 @@ Backpressure must propagate from GPU to client to prevent wasted compute. Layer 
 
 ```mermaid
 graph TD
-    subgraph L1["Layer 1: Model Runner → Router"]
+    subgraph L1["L1: Model Runner → Router"]
         GPU[GPU signals capacity constraints]
     end
     
-    subgraph L2["Layer 2: Router → API Gateway"]
+    subgraph L2["L2: Router → API Gateway"]
         Agg[Aggregate health → region capacity]
     end
     
-    subgraph L3["Layer 3: API Gateway → Client SDK"]
+    subgraph L3["L3: API Gateway → Client SDK"]
         AIMD[AIMD-based rate adjustment]
     end
     
