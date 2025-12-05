@@ -49,7 +49,7 @@ A quick reference for system design interviews and back-of-the-envelope calculat
 | Sequential NVMe SSD write (4KB, no fsync) | ~10 µs | 4-6 GB/s |
 | Sequential NVMe SSD write (4KB, +fsync) | ~1 ms | ~50 MB/s |
 | Random NVMe SSD read (4KB) | ~100 µs | ~500 MB/s |
-| Random NVMe SSD write (4KB) | ~20 µs | ~300 MB/s |
+| Random NVMe SSD write (4KB) | ~100 µs | ~300 MB/s |
 | Sequential HDD read | ~5 ms | 150-250 MB/s |
 | Random HDD read (4KB) | ~10 ms | ~1 MB/s |
 | Read 1 MB sequentially from memory | ~20 µs | ~50 GB/s |

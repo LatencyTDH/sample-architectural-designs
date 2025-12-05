@@ -11,6 +11,38 @@ A Serverless, Fully Managed Foundation Model Platform
   - [The "Serverless" Abstraction](#the-serverless-abstraction)
   - [High-Level Architecture](#high-level-architecture)
   - [Core Domain Model](#core-domain-model)
+- [Part I-B: The Control Plane (Deep Dive)](#part-i-b-the-control-plane-deep-dive)
+  - [Control Plane vs. Data Plane: Architectural Differences](#control-plane-vs-data-plane-architectural-differences)
+  - [Control Plane Architecture Overview](#control-plane-architecture-overview)
+  - [Control Plane API Design Principles](#control-plane-api-design-principles)
+  - [Provisioned Throughput Orchestration](#provisioned-throughput-orchestration)
+    - [State Machine Design](#state-machine-design)
+    - [Capacity Allocation Algorithm](#capacity-allocation-algorithm)
+    - [Capacity Reservation Workflow](#capacity-reservation-workflow)
+    - [Failure Handling & Rollback](#failure-handling--rollback)
+  - [Fine-Tuning Job System](#fine-tuning-job-system)
+    - [Fine-Tuning Architecture](#fine-tuning-architecture)
+    - [Job Lifecycle State Machine](#job-lifecycle-state-machine)
+    - [Distributed Training Orchestration](#distributed-training-orchestration)
+    - [Checkpointing Strategy](#checkpointing-strategy-critical-for-long-jobs)
+    - [Preemption & Priority Scheduling](#preemption--priority-scheduling)
+    - [Training Failure Recovery](#training-failure-recovery)
+  - [Quota & Entitlement Management](#quota--entitlement-management)
+    - [Quota Hierarchy](#quota-hierarchy)
+    - [Quota Types](#quota-types)
+    - [Quota Enforcement Architecture](#quota-enforcement-architecture)
+    - [Soft Limits vs. Hard Limits](#soft-limits-vs-hard-limits)
+    - [Limit Increase Workflow](#limit-increase-workflow)
+  - [Configuration Versioning & Deployment](#configuration-versioning--deployment)
+    - [Guardrail Versioning](#guardrail-versioning)
+    - [Safe Deployment Strategy (Guardrails)](#safe-deployment-strategy-guardrails)
+    - [Knowledge Base Sync Strategies](#knowledge-base-sync-strategies)
+    - [Configuration Propagation to Data Plane](#configuration-propagation-to-data-plane)
+  - [Control Plane Reliability](#control-plane-reliability)
+    - [Consistency Model](#consistency-model)
+    - [Control Plane Failure Modes](#control-plane-failure-modes)
+    - [Idempotency Implementation Details](#idempotency-implementation-details)
+    - [Blast Radius Containment](#blast-radius-containment)
 - [Part II: The Data Plane & API Protocol](#part-ii-the-data-plane--api-protocol)
   - [Request Lifecycle](#request-lifecycle)
     - [Speculative Guardrails Execution](#speculative-guardrails-execution)
@@ -113,6 +145,752 @@ We strictly separate the **Control Plane** (Resource Management) from the **Data
 *   **Provisioned Throughput:** A reservation of capacity. Measured in **Model Units (MU)**, where 1 MU = specific throughput (e.g., 20k input tokens/min).
 *   **Guardrail:** A set of policy rules (PII filters, topic denial) applied to a request.
 *   **Agent:** A recursive reasoning entity capable of invoking Lambda functions.
+
+---
+
+## Part I-B: The Control Plane (Deep Dive)
+
+The Control Plane is the **brain** of Bedrock—it manages all resource lifecycle operations, configuration, and long-running workflows. While the Data Plane optimizes for **low latency** (milliseconds), the Control Plane optimizes for **correctness** and **durability** (seconds to hours).
+
+### Control Plane vs. Data Plane: Architectural Differences
+
+| Dimension | Control Plane | Data Plane |
+|-----------|---------------|------------|
+| **Consistency** | Strong (read-your-writes) | Eventual (cached configs) |
+| **Latency Target** | < 500ms (sync), hours (async) | < 100ms TTFT |
+| **Availability Target** | 99.9% | 99.99% |
+| **Idempotency** | Required (all mutations) | Best-effort (retries safe) |
+| **State** | Stateful (DynamoDB, S3) | Stateless (ephemeral) |
+| **Scaling Strategy** | Vertical + modest horizontal | Massive horizontal |
+
+### Control Plane Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "Customer"
+        SDK[AWS SDK / CLI]
+    end
+    
+    subgraph "Control Plane"
+        APIGW[API Gateway]
+        AUTH[IAM Authorizer]
+        
+        subgraph "Sync APIs"
+            CRUD[Resource CRUD<br/>Lambda]
+            VALID[Validation<br/>Service]
+        end
+        
+        subgraph "Async Orchestration"
+            SFN[Step Functions<br/>Workflows]
+            QUEUE[SQS Job Queue]
+            WORKER[Worker Fleet]
+        end
+        
+        subgraph "State Store"
+            DDB[(DynamoDB<br/>Global Tables)]
+            S3_CP[(S3<br/>Artifacts)]
+        end
+    end
+    
+    subgraph "Data Plane"
+        ROUTER[Front-End Router]
+        CONFIG[Config Cache]
+    end
+    
+    SDK --> APIGW
+    APIGW --> AUTH
+    AUTH --> CRUD
+    AUTH --> SFN
+    CRUD --> VALID
+    VALID --> DDB
+    SFN --> QUEUE
+    QUEUE --> WORKER
+    WORKER --> S3_CP
+    WORKER --> DDB
+    DDB -.->|Async Replication| CONFIG
+    CONFIG --> ROUTER
+```
+
+### Control Plane API Design Principles
+
+#### 1. Idempotency (Critical for Distributed Systems)
+Every mutating Control Plane API **must** be idempotent. Network failures, timeouts, and retries are inevitable.
+
+*   **Client Token Pattern:**
+    ```json
+    POST /provisioned-model-throughput
+    {
+      "clientToken": "uuid-from-client-12345",  // Idempotency key
+      "modelId": "anthropic.claude-v2",
+      "modelUnits": 5,
+      "commitmentDuration": "ONE_MONTH"
+    }
+    ```
+
+*   **Server-Side Handling:**
+    ```
+    1. Hash(clientToken + accountId + operation) → Check DynamoDB
+    2. If exists AND status = COMPLETED → Return cached response (200 OK)
+    3. If exists AND status = PENDING → Return current state (202 Accepted)
+    4. If not exists → Create with status = PENDING, proceed
+    5. On completion → Update status = COMPLETED, cache response for 24h
+    6. On failure → Update status = FAILED, cache error for retry
+    ```
+
+*   **Why 24h TTL?** Balances storage cost vs. retry window. Most retries happen within minutes.
+
+#### 2. Optimistic Locking (Conflict Resolution)
+Concurrent modifications must not cause data loss.
+
+*   **Version Vector:**
+    ```json
+    PUT /guardrails/{guardrailId}
+    {
+      "expectedVersion": 7,  // Must match current version
+      "name": "Updated Guardrail",
+      "blockedTopics": ["violence", "illegal_activities"]
+    }
+    ```
+
+*   **On Version Mismatch:** Return `409 Conflict` with current state. Client must re-read and retry.
+
+*   **Trade-off:** Extra round-trip on conflict vs. last-write-wins data loss.
+
+#### 3. Pagination & Consistency
+List operations must handle large result sets without missing items.
+
+*   **Cursor-Based Pagination:**
+    ```json
+    GET /foundation-models?maxResults=50&nextToken=eyJsYXN0S2V5Ijo...
+    
+    Response:
+    {
+      "models": [...],
+      "nextToken": "eyJsYXN0S2V5IjoiYW50..."  // Opaque, encrypted cursor
+    }
+    ```
+
+*   **Consistency Guarantee:** Cursors are consistent snapshots. Items created after the initial request won't appear mid-pagination (prevents duplicates/skips).
+
+---
+
+### Provisioned Throughput Orchestration
+
+Provisioning dedicated GPU capacity is a **complex distributed transaction** involving capacity checks, billing contracts, and physical resource allocation.
+
+#### State Machine Design
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: CreateProvisionedThroughput
+    
+    PENDING --> VALIDATING: Start validation
+    VALIDATING --> CAPACITY_CHECK: Validation passed
+    VALIDATING --> FAILED: Validation failed
+    
+    CAPACITY_CHECK --> ALLOCATING: Capacity available
+    CAPACITY_CHECK --> WAITLISTED: Capacity exhausted
+    
+    WAITLISTED --> CAPACITY_CHECK: Capacity freed (event)
+    WAITLISTED --> CANCELLED: Customer cancels / Timeout
+    
+    ALLOCATING --> BILLING_SETUP: Resources allocated
+    ALLOCATING --> ROLLBACK: Allocation failed
+    
+    BILLING_SETUP --> ACTIVE: Billing confirmed
+    BILLING_SETUP --> ROLLBACK: Billing failed
+    
+    ROLLBACK --> FAILED: Cleanup complete
+    
+    ACTIVE --> UPDATING: ModifyProvisionedThroughput
+    UPDATING --> ACTIVE: Update complete
+    
+    ACTIVE --> DELETING: DeleteProvisionedThroughput
+    DELETING --> DELETED: Resources released
+    
+    DELETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
+```
+
+#### Capacity Allocation Algorithm
+
+The core challenge: How do we allocate GPU capacity across thousands of customers with varying commitment levels?
+
+*   **Capacity Pools:**
+    | Pool | % of Fleet | Purpose |
+    |------|-----------|---------|
+    | **Reserved (1-Year)** | 40% | Long-term commitments, highest priority |
+    | **Reserved (1-Month)** | 25% | Short-term commitments |
+    | **On-Demand Buffer** | 25% | Shared pool for pay-as-you-go |
+    | **Spot/Burst** | 10% | Overflow, preemptible |
+
+*   **Allocation Priority:**
+    ```
+    Priority Score = (CommitmentTier × 1000) + (AccountTenure × 10) + (SpendHistory × 1)
+    
+    Where:
+      CommitmentTier: 1-Year=3, 1-Month=2, On-Demand=1
+      AccountTenure: Years as AWS customer
+      SpendHistory: Normalized spend rank (0-100)
+    ```
+
+*   **Overbooking Strategy (Controversial but Necessary):**
+    *   **Problem:** Not all provisioned capacity is used 100% of the time.
+    *   **Solution:** Overbook by 15-20% based on historical utilization patterns.
+    *   **Risk Mitigation:**
+        *   Real-time utilization monitoring.
+        *   If actual usage approaches 95% of physical capacity, reject new provisions.
+        *   SLA: "Provisioned throughput available 99.9% of the time."
+    *   **Trade-off:** Higher fleet utilization (cost efficiency) vs. occasional capacity shortfalls.
+
+#### Capacity Reservation Workflow
+
+```mermaid
+sequenceDiagram
+    participant C as Customer
+    participant API as Control Plane API
+    participant SFN as Step Functions
+    participant CAP as Capacity Service
+    participant BILL as Billing Service
+    participant DP as Data Plane
+    
+    C->>API: CreateProvisionedThroughput(5 MU, Claude)
+    API->>API: Validate request, check quotas
+    API->>SFN: Start workflow (async)
+    API-->>C: 202 Accepted (ARN, status=PENDING)
+    
+    SFN->>CAP: ReserveCapacity(5 MU, us-east-1)
+    
+    alt Capacity Available
+        CAP-->>SFN: Reserved (allocation_id)
+        SFN->>BILL: CreateBillingContract(5 MU, 1-month)
+        BILL-->>SFN: Contract created
+        SFN->>DP: DeployCapacity(allocation_id)
+        DP-->>SFN: Deployed (endpoint)
+        SFN->>SFN: Update status = ACTIVE
+    else Capacity Exhausted
+        CAP-->>SFN: Waitlisted (position=47)
+        SFN->>SFN: Update status = WAITLISTED
+        Note over SFN: EventBridge waits for CapacityFreed event
+    end
+    
+    C->>API: GetProvisionedThroughput(ARN)
+    API-->>C: {status: ACTIVE, endpoint: ...}
+```
+
+#### Failure Handling & Rollback
+
+*   **Saga Pattern:** Each step has a compensating action.
+    | Step | Action | Compensating Action |
+    |------|--------|---------------------|
+    | 1 | Reserve Capacity | Release Capacity |
+    | 2 | Create Billing Contract | Cancel Contract |
+    | 3 | Deploy to Data Plane | Undeploy |
+    | 4 | Update DNS/Routing | Revert Routing |
+
+*   **Partial Failure Example:**
+    ```
+    Step 1: Reserve 5 MU ✓
+    Step 2: Create billing contract ✓
+    Step 3: Deploy to Data Plane ✗ (GPU node unhealthy)
+    
+    Rollback:
+    Step 3 compensation: N/A (nothing deployed)
+    Step 2 compensation: Cancel billing contract ✓
+    Step 1 compensation: Release 5 MU ✓
+    
+    Final state: FAILED (no charge to customer)
+    ```
+
+---
+
+### Fine-Tuning Job System
+
+Fine-tuning foundation models is a **long-running, resource-intensive workflow** that can take hours to days. This requires specialized orchestration.
+
+> **Note:** This section covers the Control Plane orchestration (job lifecycle, scheduling, checkpointing). For the training methodology (LoRA/PEFT, data isolation, security), see [The Fine-Tuning & Customization Pipeline](#the-fine-tuning--customization-pipeline) in Part IV.
+
+#### Fine-Tuning Architecture
+
+```mermaid
+graph TB
+    subgraph "Control Plane"
+        API[CreateModelCustomizationJob API]
+        SFN[Step Functions<br/>Job Orchestrator]
+        DDB[(Job State<br/>DynamoDB)]
+    end
+    
+    subgraph "Training Infrastructure"
+        SCHED[Training Scheduler]
+        
+        subgraph "Training Cell"
+            MASTER[Master Node]
+            WORKER1[Worker 1<br/>8x H100]
+            WORKER2[Worker 2<br/>8x H100]
+            WORKER3[Worker 3<br/>8x H100]
+            WORKER4[Worker 4<br/>8x H100]
+        end
+        
+        EFS[(EFS<br/>Checkpoints)]
+        S3_DATA[(S3<br/>Training Data)]
+        S3_MODEL[(S3<br/>Model Artifacts)]
+    end
+    
+    subgraph "Monitoring"
+        CW[CloudWatch<br/>Metrics]
+        ALARM[Alarms]
+    end
+    
+    API --> SFN
+    SFN --> DDB
+    SFN --> SCHED
+    SCHED --> MASTER
+    MASTER --> WORKER1
+    MASTER --> WORKER2
+    MASTER --> WORKER3
+    MASTER --> WORKER4
+    WORKER1 --> EFS
+    WORKER2 --> EFS
+    S3_DATA --> MASTER
+    MASTER --> S3_MODEL
+    MASTER --> CW
+    CW --> ALARM
+    ALARM --> SFN
+```
+
+#### Job Lifecycle State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: CreateModelCustomizationJob
+    
+    PENDING --> VALIDATING: Job accepted
+    VALIDATING --> QUEUED: Validation passed
+    VALIDATING --> FAILED: Invalid config/data
+    
+    QUEUED --> INITIALIZING: Resources available
+    QUEUED --> QUEUED: Waiting for capacity
+    
+    INITIALIZING --> TRAINING: Data loaded, model initialized
+    INITIALIZING --> FAILED: Init error
+    
+    TRAINING --> TRAINING: Checkpoint saved
+    TRAINING --> EVALUATING: Training complete
+    TRAINING --> STOPPING: StopJob called
+    TRAINING --> FAILED: Training error (after retries)
+    
+    STOPPING --> STOPPED: Graceful shutdown
+    
+    EVALUATING --> PUBLISHING: Eval passed
+    EVALUATING --> FAILED: Eval failed (model quality)
+    
+    PUBLISHING --> COMPLETED: Model registered
+    
+    COMPLETED --> [*]
+    STOPPED --> [*]
+    FAILED --> [*]
+```
+
+#### Distributed Training Orchestration
+
+*   **Data Parallelism:** Split training data across workers. Each worker has full model copy.
+*   **Tensor Parallelism:** Split model layers across GPUs within a node (NVLink).
+*   **Pipeline Parallelism:** Split model stages across nodes (for 70B+ models).
+
+*   **Gradient Synchronization:**
+    | Strategy | Latency | Fault Tolerance | Use Case |
+    |----------|---------|-----------------|----------|
+    | **AllReduce (Ring)** | Low | Poor (any failure blocks) | Small clusters |
+    | **Parameter Server** | Medium | Good (PS is SPOF) | Medium clusters |
+    | **Gossip-based** | High | Excellent | Large, unreliable clusters |
+
+*   **Bedrock Choice:** Ring AllReduce with **checkpoint-based recovery** for clusters up to 64 nodes. Beyond that, hierarchical AllReduce.
+
+#### Checkpointing Strategy (Critical for Long Jobs)
+
+*   **Checkpoint Contents:**
+    *   Model weights (sharded across workers).
+    *   Optimizer state (Adam momentum, variance).
+    *   Learning rate scheduler state.
+    *   Data loader position (which samples processed).
+    *   Random number generator states.
+
+*   **Checkpoint Frequency:**
+    | Job Duration | Checkpoint Interval | Storage Cost | Recovery Time |
+    |--------------|---------------------|--------------|---------------|
+    | < 2 hours | Every 30 min | Low | < 30 min lost |
+    | 2-8 hours | Every 15 min | Medium | < 15 min lost |
+    | > 8 hours | Every 10 min | High | < 10 min lost |
+
+*   **Async Checkpointing:** 
+    *   Checkpoint write happens in background thread.
+    *   Training continues during checkpoint save.
+    *   Uses copy-on-write semantics to avoid blocking.
+
+*   **Checkpoint Storage:**
+    *   **Primary:** Amazon EFS (low-latency recovery within AZ).
+    *   **Secondary:** S3 (cross-region durability, async replication).
+
+#### Preemption & Priority Scheduling
+
+Fine-tuning jobs compete for GPU resources. We implement a priority-based preemption system.
+
+*   **Priority Levels:**
+    | Priority | Job Type | Preemptible | Example |
+    |----------|----------|-------------|---------|
+    | **P0** | Production model refresh | No | Scheduled weekly retrain |
+    | **P1** | Customer fine-tune (paid) | No | Enterprise customer job |
+    | **P2** | Customer fine-tune (trial) | Yes (with checkpoint) | Free tier experimentation |
+    | **P3** | Internal experiments | Yes | AWS internal R&D |
+
+*   **Preemption Flow:**
+    ```
+    1. P0 job submitted, no capacity available
+    2. Scheduler identifies P3 job on target nodes
+    3. Send SIGTERM to P3 job (30s grace period)
+    4. P3 job saves checkpoint, releases resources
+    5. P0 job starts on freed resources
+    6. P3 job re-queued, will resume from checkpoint when capacity available
+    ```
+
+*   **Fairness Guarantee:** No job can be preempted more than 3 times. After that, it's promoted to non-preemptible.
+
+#### Training Failure Recovery
+
+| Failure Type | Detection | Recovery Action |
+|--------------|-----------|-----------------|
+| **Single GPU failure** | NCCL timeout | Restart job on healthy node from checkpoint |
+| **Single node failure** | Heartbeat miss | Restart job with N-1 nodes if possible, else checkpoint + re-queue |
+| **Network partition** | Gradient sync timeout | Pause, wait for recovery, resume |
+| **Data corruption** | Checksum mismatch | Reload data shard from S3 |
+| **OOM (GPU)** | CUDA OOM error | Reduce batch size, restart from checkpoint |
+| **Spot termination** | 2-min warning | Emergency checkpoint, re-queue |
+
+---
+
+### Quota & Entitlement Management
+
+Quotas prevent resource exhaustion and ensure fair sharing across tenants.
+
+#### Quota Hierarchy
+
+```mermaid
+graph TD
+    subgraph "AWS Organization"
+        ORG[Organization Quota<br/>1000 MU total]
+        
+        subgraph "Account A (Production)"
+            ACCT_A[Account Quota<br/>500 MU]
+            
+            subgraph "Regions"
+                REG_A1[us-east-1: 300 MU]
+                REG_A2[eu-west-1: 200 MU]
+            end
+        end
+        
+        subgraph "Account B (Development)"
+            ACCT_B[Account Quota<br/>100 MU]
+            REG_B1[us-east-1: 100 MU]
+        end
+        
+        UNUSED[Unallocated: 400 MU]
+    end
+    
+    ORG --> ACCT_A
+    ORG --> ACCT_B
+    ORG --> UNUSED
+    ACCT_A --> REG_A1
+    ACCT_A --> REG_A2
+    ACCT_B --> REG_B1
+```
+
+#### Quota Types
+
+| Quota Type | Scope | Default | Adjustable | Enforcement |
+|------------|-------|---------|------------|-------------|
+| **Provisioned Throughput (MU)** | Region | 10 MU | Yes (support ticket) | Hard limit |
+| **Concurrent Fine-Tuning Jobs** | Account | 2 | Yes | Hard limit |
+| **Knowledge Bases** | Region | 10 | Yes | Hard limit |
+| **Guardrails** | Account | 50 | Yes | Hard limit |
+| **Agents** | Region | 10 | Yes | Hard limit |
+| **On-Demand Tokens/Min** | Region | 100K | Auto-scales | Soft limit (throttle) |
+
+#### Quota Enforcement Architecture
+
+```mermaid
+sequenceDiagram
+    participant C as Customer
+    participant API as API Gateway
+    participant QS as Quota Service
+    participant CACHE as Redis Cache
+    participant DDB as DynamoDB
+    
+    C->>API: CreateProvisionedThroughput(10 MU)
+    API->>QS: CheckQuota(account, region, "provisioned_mu", 10)
+    
+    QS->>CACHE: Get current usage
+    
+    alt Cache Hit
+        CACHE-->>QS: Usage = 5 MU
+    else Cache Miss
+        QS->>DDB: Query usage
+        DDB-->>QS: Usage = 5 MU
+        QS->>CACHE: Set usage (TTL 60s)
+    end
+    
+    QS->>QS: Limit = 10, Usage = 5, Requested = 10
+    QS->>QS: 5 + 10 = 15 > 10 ❌
+    
+    QS-->>API: QUOTA_EXCEEDED (current=5, limit=10, requested=10)
+    API-->>C: 400 ServiceQuotaExceededException
+```
+
+#### Soft Limits vs. Hard Limits
+
+*   **Hard Limits:** Enforced synchronously. Request fails immediately if exceeded.
+    *   Example: Provisioned Throughput, Fine-Tuning Jobs.
+    *   Reason: Resource-backed, cannot overcommit.
+
+*   **Soft Limits:** Enforced with grace period or throttling.
+    *   Example: On-Demand tokens/minute.
+    *   Behavior: Allow 20% burst above limit for 60 seconds, then throttle.
+    *   Reason: Better UX, handles legitimate spikes.
+
+#### Limit Increase Workflow
+
+```mermaid
+stateDiagram-v2
+    [*] --> SUBMITTED: RequestServiceQuotaIncrease
+    
+    SUBMITTED --> AUTO_APPROVED: Within auto-approval threshold
+    SUBMITTED --> PENDING_REVIEW: Exceeds auto-approval
+    
+    AUTO_APPROVED --> APPLIED: Update quota in DDB
+    
+    PENDING_REVIEW --> APPROVED: Human review passed
+    PENDING_REVIEW --> DENIED: Review failed
+    PENDING_REVIEW --> INFO_REQUIRED: Need justification
+    
+    INFO_REQUIRED --> PENDING_REVIEW: Customer responds
+    
+    APPROVED --> APPLIED: Update quota
+    
+    APPLIED --> [*]
+    DENIED --> [*]
+```
+
+*   **Auto-Approval Criteria:**
+    *   Account in good standing (no payment issues).
+    *   Request ≤ 2x current limit.
+    *   Account age > 90 days.
+    *   No recent abuse flags.
+
+*   **Manual Review Triggers:**
+    *   Request > 5x current limit.
+    *   New account (< 30 days).
+    *   Previous abuse history.
+    *   Regulated industry (finance, healthcare).
+
+---
+
+### Configuration Versioning & Deployment
+
+Guardrails, Knowledge Bases, and other configurations require careful version management and safe deployment.
+
+#### Guardrail Versioning
+
+```mermaid
+graph LR
+    subgraph "Guardrail: content-filter-prod"
+        V1[Version 1<br/>Created: Jan 1<br/>Status: DEPRECATED]
+        V2[Version 2<br/>Created: Feb 15<br/>Status: ACTIVE]
+        V3[Version 3<br/>Created: Mar 1<br/>Status: DRAFT]
+    end
+    
+    V1 -->|Superseded by| V2
+    V2 -->|Draft update| V3
+    
+    subgraph "Aliases"
+        PROD[Alias: PROD → V2]
+        STAGING[Alias: STAGING → V3]
+    end
+```
+
+*   **Version States:**
+    | State | Mutable | Usable in Production | Description |
+    |-------|---------|---------------------|-------------|
+    | **DRAFT** | Yes | No | Work in progress |
+    | **ACTIVE** | No | Yes | Immutable, production-ready |
+    | **DEPRECATED** | No | Yes (with warning) | Scheduled for deletion |
+    | **DELETED** | N/A | No | Soft-deleted, 30-day recovery window |
+
+*   **Alias-Based Deployment:**
+    *   Aliases (`PROD`, `STAGING`, `CANARY`) point to specific versions.
+    *   Update alias atomically: `UpdateGuardrailAlias(alias=PROD, targetVersion=3)`.
+    *   Instant rollback: Point alias back to previous version.
+
+#### Safe Deployment Strategy (Guardrails)
+
+Guardrail changes can have significant impact. We implement progressive rollout.
+
+```mermaid
+sequenceDiagram
+    participant ENG as Engineer
+    participant CP as Control Plane
+    participant DP as Data Plane
+    participant MON as Monitoring
+    
+    ENG->>CP: CreateGuardrailVersion(v3)
+    CP-->>ENG: Version created (DRAFT)
+    
+    ENG->>CP: PublishGuardrailVersion(v3)
+    CP->>CP: Run validation tests
+    CP-->>ENG: Version ACTIVE
+    
+    ENG->>CP: UpdateAlias(CANARY → v3)
+    CP->>DP: Propagate to 1% of routers
+    
+    Note over MON: Monitor for 1 hour
+    MON->>MON: Check: Block rate, false positives
+    
+    alt Metrics healthy
+        ENG->>CP: UpdateAlias(PROD → v3)
+        CP->>DP: Propagate to 100%
+    else Metrics degraded
+        ENG->>CP: UpdateAlias(CANARY → v2)
+        Note over ENG: Investigate and fix
+    end
+```
+
+#### Knowledge Base Sync Strategies
+
+Knowledge Bases ingest documents from S3. Sync must handle large datasets efficiently.
+
+*   **Sync Modes:**
+    | Mode | Trigger | Use Case | Latency |
+    |------|---------|----------|---------|
+    | **On-Demand** | API call | Ad-hoc updates | Minutes |
+    | **Scheduled** | Cron (hourly/daily) | Regular refresh | Hours |
+    | **Event-Driven** | S3 events | Real-time updates | Seconds |
+
+*   **Incremental Sync:**
+    ```
+    1. List S3 objects with LastModified > lastSyncTime
+    2. For each modified/new object:
+       a. Chunk document
+       b. Generate embeddings (Titan Embeddings)
+       c. Upsert vectors to OpenSearch
+    3. For deleted objects:
+       a. Delete vectors from OpenSearch
+    4. Update lastSyncTime
+    ```
+
+*   **Consistency Guarantee:**
+    *   **Eventual:** Queries may return stale results during sync.
+    *   **Read-Your-Writes:** After ingestion job *completes* (not just starts), subsequent queries include new data.
+    *   Implementation: Sync job waits for OpenSearch refresh before marking job status as `COMPLETE`. Poll `GetIngestionJob` or use EventBridge for completion notification.
+
+#### Configuration Propagation to Data Plane
+
+Control Plane changes must propagate to Data Plane with bounded latency.
+
+```mermaid
+sequenceDiagram
+    participant CP as Control Plane
+    participant DDB as DynamoDB
+    participant STREAM as DynamoDB Streams
+    participant LAMBDA as Propagation Lambda
+    participant CACHE as Config Cache (Redis)
+    participant DP as Data Plane Router
+    
+    CP->>DDB: UpdateGuardrail(v3)
+    DDB->>STREAM: Change event
+    STREAM->>LAMBDA: Trigger
+    LAMBDA->>CACHE: Invalidate key
+    LAMBDA->>CACHE: Set new value (TTL 60s)
+    
+    Note over DP: Next request
+    DP->>CACHE: Get guardrail config
+    CACHE-->>DP: Return v3 config
+```
+
+*   **Propagation SLA:**
+    | Change Type | Target Latency | Mechanism |
+    |-------------|----------------|-----------|
+    | Guardrail update | < 30 seconds | DDB Streams + Cache invalidation |
+    | Quota change | < 60 seconds | DDB Streams + Cache invalidation |
+    | New Provisioned Throughput | < 5 minutes | Workflow completion + DNS update |
+    | Knowledge Base sync | < 15 minutes | Async job + OpenSearch refresh |
+
+---
+
+### Control Plane Reliability
+
+#### Consistency Model
+
+*   **Strong Consistency (Control Plane APIs):** All reads immediately reflect the most recent write. No stale reads.
+    *   Implementation: DynamoDB strongly consistent reads.
+    *   Cost: Higher latency (~2x eventually consistent) due to cross-AZ coordination.
+    *   Use case: `GetGuardrail` after `UpdateGuardrail` returns the updated version.
+
+*   **Eventual Consistency (Data Plane Config Reads):**
+    *   Data Plane reads config from cache (Redis) with 60-second TTL.
+    *   Trade-off: Lower latency, but config changes may take up to 60 seconds to propagate.
+    *   Use case: Guardrail enforcement uses cached config; brief window where old rules apply.
+
+*   **Read-Your-Writes (Session Guarantee):**
+    *   Within the same API session, a client always sees their own writes—even if reading from cache.
+    *   Implementation: Write-through to cache on Control Plane mutations; session affinity optional.
+    *   Use case: Console UI updates immediately after user clicks "Save."
+
+#### Control Plane Failure Modes
+
+| Failure | Impact | Mitigation | RTO |
+|---------|--------|------------|-----|
+| **API Gateway down** | No new configs | Multi-AZ API Gateway, Route 53 failover | < 60s |
+| **DynamoDB partition failure** | Partial data unavailable | Global Tables (multi-region) | < 30s |
+| **Step Functions failure** | Async jobs stuck | Retry with exponential backoff, DLQ | < 5min |
+| **Config cache failure** | Data Plane uses stale config | Fall back to DynamoDB direct read | < 10s |
+| **Lambda throttling** | Slow config propagation | Reserved concurrency, overflow to SQS | < 2min |
+
+#### Idempotency Implementation Details
+
+*   **Idempotency Key Storage:**
+    ```
+    Table: IdempotencyKeys
+    PK: SHA256(clientToken + accountId + operation)
+    Attributes:
+      - status: PENDING | COMPLETED | FAILED
+      - response: (cached response body)
+      - expiresAt: TTL (24 hours)
+      - createdAt: timestamp
+    ```
+
+*   **Race Condition Handling:**
+    *   Use DynamoDB conditional writes: `PutItem IF NOT EXISTS`.
+    *   If two requests race, one wins (creates record), other gets `ConditionalCheckFailed`.
+    *   Loser polls for winner's result.
+
+*   **Orphan Cleanup:**
+    *   If a request starts but never completes (crash), status stays `PENDING`.
+    *   Background job: Mark `PENDING` records older than 1 hour as `FAILED`.
+    *   Client can retry with same token, will create fresh attempt.
+
+#### Blast Radius Containment
+
+*   **Cell-Based Isolation:**
+    *   Control Plane is deployed in cells (similar to Data Plane).
+    *   Each cell serves a subset of accounts (consistent hashing).
+    *   Failure in Cell A doesn't affect Cell B customers.
+
+*   **Dependency Isolation:**
+    *   Each Control Plane component has circuit breakers.
+    *   If Billing Service is slow, provisioning degrades gracefully (queued, not failed).
+
+*   **Regional Independence:**
+    *   Control Plane in `us-east-1` operates independently from `eu-west-1`.
+    *   Global Tables provide data replication, not operational coupling.
 
 ---
 
@@ -1153,6 +1931,8 @@ Deep visibility into agent behavior.
 
 ### The Fine-Tuning & Customization Pipeline
 While inference is the high-frequency path, fine-tuning is the high-complexity path. We must allow users to adapt models (e.g., DeepSeek-V3) to their data without leaking that data or the base model weights. See the [Fine-Tuning Pipeline Architecture](#fine-tuning-pipeline-architecture) diagram.
+
+> **Note:** For Control Plane orchestration details (job state machines, checkpointing, preemption, distributed training), see [Fine-Tuning Job System](#fine-tuning-job-system) in Part I-B.
 
 #### 1. Architecture: The Job Orchestrator
 Fine-tuning is asynchronous and long-running (hours/days).
